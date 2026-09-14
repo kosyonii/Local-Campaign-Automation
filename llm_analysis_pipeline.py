@@ -19,6 +19,7 @@ from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 import pandas as pd
 from openpyxl import load_workbook
 from openpyxl.worksheet.worksheet import Worksheet
+from dotenv import load_dotenv
 
 
 # =========================================================
@@ -26,6 +27,15 @@ from openpyxl.worksheet.worksheet import Worksheet
 # =========================================================
 
 BASE_DIR = Path(__file__).resolve().parent
+ENV_FILE = BASE_DIR / ".env"
+
+# 프로젝트 루트의 기존 .env를 공통 설정 파일로 사용한다.
+# OS/실행환경에 이미 설정된 환경변수는 덮어쓰지 않는다.
+load_dotenv(
+    dotenv_path=ENV_FILE,
+    override=False,
+)
+
 OUTPUT_DIR = BASE_DIR / "output"
 PROMPTS_DIR = BASE_DIR / "prompts"
 CONFIG_DIR = BASE_DIR / "config"
@@ -125,9 +135,11 @@ TARGET_SUBSIDIARY_COLUMN = (
     "Subsidiary (Country) / Influencer (Subsidiary)"
 )
 TARGET_INFLUENCER_COLUMN = "Influencer"
+TARGET_GIVEAWAY_COLUMN = "Giveaway"
 
 TARGET_WRITEBACK_COLUMNS = (
     *TARGET_OUTPUT_COLUMNS,
+    TARGET_GIVEAWAY_COLUMN,
     TARGET_SUBSIDIARY_COLUMN,
     TARGET_INFLUENCER_COLUMN,
 )
@@ -143,11 +155,6 @@ MIN_AUTO_PUBLISHER_CONFIDENCE = int(
     os.getenv("MIN_AUTO_PUBLISHER_CONFIDENCE", "70")
 )
 
-# v9 프롬프트/스키마: 인플루언서 정보와 Giveaway 리워드 줄을 포함할 수 있다.
-MAX_DESCRIPTION_LENGTH = int(
-    os.getenv("MAX_DESCRIPTION_LENGTH", "180")
-)
-
 # header row를 직접 지정하지 않으면 1~이 값까지 탐색
 TARGET_HEADER_SCAN_MAX_ROWS = 15
 
@@ -161,6 +168,13 @@ GOOGLE_CLOUD_PROJECT = os.getenv(
 GOOGLE_CLOUD_LOCATION = os.getenv(
     "GOOGLE_CLOUD_LOCATION",
     "global",
+)
+GOOGLE_SERVICE_ACCOUNT_FILE = (
+    os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE")
+    or os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+)
+GOOGLE_CLOUD_PLATFORM_SCOPE = (
+    "https://www.googleapis.com/auth/cloud-platform"
 )
 GEMINI_MODEL = os.getenv(
     "GEMINI_MODEL",
@@ -221,7 +235,6 @@ DEFAULT_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
         },
         "Description": {
             "type": "string",
-            "maxLength": MAX_DESCRIPTION_LENGTH,
             "description": (
                 "한국어 보고서형 설명. 일반 게시물은 한 문장으로 작성하고, "
                 "경품 게시물은 본문 다음 줄에 '→ 구체적인 경품 설명' 형식을 "
@@ -571,23 +584,63 @@ def is_unknown_media_input(
 
 def normalize_cxp_feature_value(value: str) -> str:
     """
-    CXP Product Feature 값을 Excel 셀 내부 줄바꿈 형식으로 정규화한다.
+    CXP Product Feature 값을 deterministic하게 정규화한다.
 
-    지원 입력 예:
-        Camera_Horizontal Lock, Camera_Super Steady
-        Camera_Horizontal Lock\nCamera_Super Steady
-        - Camera_Horizontal Lock\n- Camera_Super Steady
+    핵심 규칙
+    ---------------------------------------------------------
+    1. 쉼표 / 세미콜론 / 실제 줄바꿈 / literal "\\n" 모두 지원
+    2. bullet / 번호 목록 기호 제거
+    3. 동일 값 중복 제거
+    4. 일부 명백한 비표준 명칭을 공식 Allowed Value로 교정
+    5. 동일 Category에서 Detail Feature가 하나라도 존재하면
+       해당 Category의 *_General을 반드시 제거
+    6. General/Detail 상호배타 처리 후 최대 3개까지만 유지
 
-    최종 저장 예:
+    예:
+        Design_General
+        Design_Color
+
+        -> Design_Color
+
+        Camera_General
+        Camera_Zoom
         Camera_Horizontal Lock
-        Camera_Super Steady
+
+        -> Camera_Zoom
+           Camera_Horizontal Lock
+
+        AP/Memory_General
+        AP/Memory_AP Performance
+
+        -> AP/Memory_AP Performance
     """
 
-    if not value.strip():
+    if value is None:
         return ""
 
-    # 쉼표, 세미콜론, 실제 줄바꿈을 모두 항목 구분자로 처리
-    raw_items = re.split(r"[\r\n,;]+", value)
+    source_text = str(value).strip()
+    if not source_text:
+        return ""
+
+    # Gemini가 JSON/string 안에서 literal "\\n"을 남기는 경우까지 처리한다.
+    normalized_source = (
+        source_text
+        .replace("\\n", "\n")
+        .replace("\r\n", "\n")
+        .replace("\r", "\n")
+    )
+
+    # 프롬프트에서 이미 확정된 공식 CXP 명칭에 대한
+    # deterministic typo/legacy normalization.
+    exact_aliases = {
+        "AP/Memory_Performance": "AP/Memory_AP Performance",
+        "Camera_Horizon Lock": "Camera_Horizontal Lock",
+    }
+
+    raw_items = re.split(
+        r"[\n,;]+",
+        normalized_source,
+    )
 
     normalized_items: list[str] = []
     seen: set[str] = set()
@@ -602,14 +655,153 @@ def normalize_cxp_feature_value(value: str) -> str:
             item,
         ).strip()
 
-        if not item or item in seen:
+        if not item:
+            continue
+
+        item = exact_aliases.get(
+            item,
+            item,
+        )
+
+        if item in seen:
             continue
 
         seen.add(item)
         normalized_items.append(item)
 
-    # 프롬프트 규칙에 따라 최대 3개까지만 저장
-    return "\n".join(normalized_items[:3])
+    if not normalized_items:
+        return ""
+
+    # ---------------------------------------------------------
+    # SAME-CATEGORY GENERAL / DETAIL EXCLUSIVITY
+    # ---------------------------------------------------------
+    #
+    # CXP 값 구조:
+    #   Category_Detail
+    #
+    # 예:
+    #   Design_General
+    #   Design_Color
+    #
+    # "_" 앞쪽 전체를 category로 사용한다.
+    # ---------------------------------------------------------
+
+    categories_with_detail: set[str] = set()
+
+    parsed_items: list[
+        tuple[str, str | None, str | None]
+    ] = []
+
+    for item in normalized_items:
+        if "_" not in item:
+            parsed_items.append(
+                (
+                    item,
+                    None,
+                    None,
+                )
+            )
+            continue
+
+        category, detail = item.split(
+            "_",
+            1,
+        )
+
+        category = category.strip()
+        detail = detail.strip()
+
+        parsed_items.append(
+            (
+                item,
+                category,
+                detail,
+            )
+        )
+
+        if (
+            category
+            and detail
+            and detail.casefold() != "general"
+        ):
+            categories_with_detail.add(
+                category.casefold()
+            )
+
+    filtered_items: list[str] = []
+
+    for (
+        item,
+        category,
+        detail,
+    ) in parsed_items:
+
+        if (
+            category is not None
+            and detail is not None
+            and detail.casefold() == "general"
+            and category.casefold()
+            in categories_with_detail
+        ):
+            # 같은 Category에 Detail이 있으므로 General 제거.
+            continue
+
+        filtered_items.append(item)
+
+    # General을 먼저 제거한 뒤 최대 3개 적용.
+    final_items = filtered_items[:3]
+
+    # ---------------------------------------------------------
+    # POST-CONDITION
+    # ---------------------------------------------------------
+    # 코드 자체의 회귀로 General + Detail이 다시 공존하지 않도록
+    # 마지막에 한 번 더 fail-closed 검사한다.
+    # ---------------------------------------------------------
+
+    final_category_details: dict[str, set[str]] = {}
+
+    for item in final_items:
+        if "_" not in item:
+            continue
+
+        category, detail = item.split(
+            "_",
+            1,
+        )
+
+        category_key = category.strip().casefold()
+        detail_key = detail.strip().casefold()
+
+        if not category_key or not detail_key:
+            continue
+
+        final_category_details.setdefault(
+            category_key,
+            set(),
+        ).add(
+            detail_key
+        )
+
+    conflicts = [
+        category
+        for category, details
+        in final_category_details.items()
+        if (
+            "general" in details
+            and any(
+                detail != "general"
+                for detail in details
+            )
+        )
+    ]
+
+    if conflicts:
+        raise RuntimeError(
+            "CXP General/Detail deterministic normalization 실패: "
+            f"{sorted(conflicts)}"
+        )
+
+    return "\n".join(final_items)
 
 
 
@@ -679,6 +871,25 @@ def normalize_description_value(value: str) -> str:
         return main_text
     
     return f"{main_text}\n→ {reward_text}".rstrip()
+
+
+def derive_giveaway_value(description: Any) -> str:
+    """Description의 화살표 표기만으로 Giveaway 여부를 확정한다.
+
+    규칙:
+        Description에 '→' 또는 '->'가 하나라도 있으면 Yes
+        그 외에는 No
+
+    Gemini response schema에는 Giveaway를 추가하지 않고,
+    파싱이 완료된 Description을 기준으로 Python에서 deterministic하게 생성한다.
+    """
+
+    description_text = optional_text(description) or ""
+
+    if "→" in description_text or "->" in description_text:
+        return "Yes"
+
+    return "No"
     
 
 def normalize_account_identifier(value: Any) -> str:
@@ -1624,15 +1835,6 @@ def validate_response_schema(
             f"actual={sorted(publisher_enum)}"
         )
 
-    description_schema = properties["Description"]
-    description_max_length = description_schema.get("maxLength")
-    if description_max_length != MAX_DESCRIPTION_LENGTH:
-        raise ValueError(
-            "Description maxLength가 Python 설정과 일치하지 않습니다: "
-            f"schema={description_max_length}, "
-            f"python={MAX_DESCRIPTION_LENGTH}"
-        )
-
     required = set(schema.get("required") or [])
     if required != expected_columns:
         raise ValueError(
@@ -1991,6 +2193,70 @@ def build_gemini_contents(
 # =========================================================
 
 
+def load_google_service_account_credentials() -> Any:
+    """Service Account JSON을 직접 읽어 Vertex AI 인증 객체를 생성한다.
+
+    우선순위:
+        1. GOOGLE_SERVICE_ACCOUNT_FILE
+        2. GOOGLE_APPLICATION_CREDENTIALS
+
+    CLI 기반 로그인이나 로컬 ADC 사전 생성에 의존하지 않는다.
+    """
+
+    try:
+        from google.oauth2 import service_account
+    except ImportError as exc:
+        raise ImportError(
+            "google-auth 패키지가 설치되어 있지 않습니다. "
+            "다음 명령으로 설치하세요: uv pip install google-auth"
+        ) from exc
+
+    credentials_path_text = optional_text(
+        GOOGLE_SERVICE_ACCOUNT_FILE
+    )
+
+    if credentials_path_text is None:
+        raise RuntimeError(
+            "Google Service Account JSON 경로가 설정되지 않았습니다.\n"
+            "GOOGLE_SERVICE_ACCOUNT_FILE 또는 "
+            "GOOGLE_APPLICATION_CREDENTIALS 환경변수에 "
+            "Service Account JSON 파일 경로를 설정하세요."
+        )
+
+    expanded_path_text = os.path.expandvars(
+        credentials_path_text
+    )
+    credentials_path = Path(
+        expanded_path_text
+    ).expanduser()
+
+    if not credentials_path.is_absolute():
+        credentials_path = (
+            BASE_DIR / credentials_path
+        ).resolve()
+    else:
+        credentials_path = credentials_path.resolve()
+
+    if not credentials_path.is_file():
+        raise FileNotFoundError(
+            "Google Service Account JSON 파일을 찾을 수 없습니다: "
+            f"{credentials_path}"
+        )
+
+    try:
+        return service_account.Credentials.from_service_account_file(
+            str(credentials_path),
+            scopes=[
+                GOOGLE_CLOUD_PLATFORM_SCOPE,
+            ],
+        )
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(
+            "Google Service Account JSON을 인증 정보로 읽지 못했습니다: "
+            f"{credentials_path}"
+        ) from exc
+
+
 def create_genai_client() -> tuple[Any, Any]:
     try:
         from google import genai
@@ -2001,9 +2267,12 @@ def create_genai_client() -> tuple[Any, Any]:
             "다음 명령으로 설치하세요: uv pip install google-genai"
         ) from exc
 
+    credentials = load_google_service_account_credentials()
+
     client_kwargs = {
         "project": GOOGLE_CLOUD_PROJECT,
         "location": GOOGLE_CLOUD_LOCATION,
+        "credentials": credentials,
         "http_options": types.HttpOptions(api_version="v1"),
     }
 
@@ -2045,21 +2314,193 @@ def is_retryable_api_error(exc: Exception) -> bool:
     return any(marker in text for marker in retry_markers)
 
 
+def _coerce_response_string(value: Any) -> str:
+    """Gemini가 문자열 필드에 다른 JSON 타입을 반환해도 최대한 문자열로 보존한다."""
+
+    if value is None:
+        return ""
+
+    if isinstance(value, str):
+        return value
+
+    if isinstance(value, (list, tuple, set)):
+        return "\n".join(
+            _coerce_response_string(item)
+            for item in value
+            if item is not None
+        )
+
+    if isinstance(value, dict):
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
+    return str(value)
+
+
+def _strip_json_code_fence(response_text: str) -> str:
+    """```json ... ``` 형태의 wrapper만 제거한다."""
+
+    stripped = response_text.strip()
+
+    if not stripped.startswith("```"):
+        return stripped
+
+    lines = stripped.splitlines()
+    if lines and lines[0].strip().startswith("```"):
+        lines = lines[1:]
+    if lines and lines[-1].strip() == "```":
+        lines = lines[:-1]
+
+    return "\n".join(lines).strip()
+
+
+def _decode_partial_json_string(raw_value: str) -> str:
+    """닫는 따옴표가 잘린 JSON string도 가능한 범위까지 복구한다."""
+
+    try:
+        loaded = json.loads(f'"{raw_value}"')
+        return loaded if isinstance(loaded, str) else str(loaded)
+    except json.JSONDecodeError:
+        return (
+            raw_value
+            .replace("\\n", "\n")
+            .replace("\\r", "\r")
+            .replace("\\t", "\t")
+            .replace('\\"', '"')
+            .replace("\\\\", "\\")
+        )
+
+
+def _extract_json_value_after_key(
+    response_text: str,
+    value_start: int,
+) -> tuple[bool, Any]:
+    """JSON object 안에서 key 뒤의 scalar/object 값을 가능한 범위까지 읽는다."""
+
+    length = len(response_text)
+    index = value_start
+
+    while index < length and response_text[index].isspace():
+        index += 1
+
+    if index >= length:
+        return False, None
+
+    first_char = response_text[index]
+
+    if first_char == '"':
+        index += 1
+        string_start = index
+        escaped = False
+
+        while index < length:
+            char = response_text[index]
+
+            if escaped:
+                escaped = False
+                index += 1
+                continue
+
+            if char == "\\":
+                escaped = True
+                index += 1
+                continue
+
+            if char == '"':
+                raw_string = response_text[string_start:index]
+                return True, _decode_partial_json_string(raw_string)
+
+            index += 1
+
+        # 응답이 문자열 도중 잘린 경우: 남아 있는 문자열을 그대로 살린다.
+        raw_string = response_text[string_start:]
+        return True, _decode_partial_json_string(raw_string)
+
+    # 문자열 외 JSON 값은 표준 decoder로 우선 읽는다.
+    try:
+        decoded_value, _ = json.JSONDecoder().raw_decode(
+            response_text[index:]
+        )
+        return True, decoded_value
+    except json.JSONDecodeError:
+        pass
+
+    # primitive 값이 마지막에 잘린 경우도 가능한 부분까지 읽는다.
+    end_index = index
+    while (
+        end_index < length
+        and response_text[end_index] not in {",", "}", "\r", "\n"}
+    ):
+        end_index += 1
+
+    raw_value = response_text[index:end_index].strip()
+    if not raw_value:
+        return False, None
+
+    lowered = raw_value.lower()
+    if lowered == "true":
+        return True, True
+    if lowered == "false":
+        return True, False
+    if lowered == "null":
+        return True, None
+
+    try:
+        if re.fullmatch(r"[-+]?\d+", raw_value):
+            return True, int(raw_value)
+        if re.fullmatch(
+            r"[-+]?(?:\d+\.\d*|\d*\.\d+)(?:[eE][-+]?\d+)?",
+            raw_value,
+        ):
+            return True, float(raw_value)
+    except (TypeError, ValueError):
+        pass
+
+    return True, raw_value
+
+
+def extract_fields_from_raw_response(
+    response_text: str,
+    response_schema: dict[str, Any],
+) -> dict[str, Any]:
+    """완전한 JSON 파싱이 실패해도 schema 필드를 개별적으로 최대한 복구한다."""
+
+    recovered: dict[str, Any] = {}
+
+    for column_name in response_output_columns(response_schema):
+        key_pattern = re.compile(
+            rf'"{re.escape(column_name)}"\s*:',
+            flags=re.DOTALL,
+        )
+        match = key_pattern.search(response_text)
+        if match is None:
+            continue
+
+        found, value = _extract_json_value_after_key(
+            response_text=response_text,
+            value_start=match.end(),
+        )
+        if found:
+            recovered[column_name] = value
+
+    return recovered
+
+
 def validate_parsed_output(
     parsed_output: dict[str, Any],
     response_schema: dict[str, Any],
 ) -> dict[str, Any]:
+    """Gemini가 반환한 값을 가능한 범위까지 보존하면서 표준 컬럼으로 정규화한다.
+
+    기존처럼 key 하나가 없거나 타입이 조금 다르다는 이유로 응답 전체를
+    실패시키지 않는다. schema에 없는 추가 key는 무시하고, 누락된 key는
+    안전한 기본값으로 채운다.
+    """
+
     output_columns = response_output_columns(response_schema)
-
-    expected = set(output_columns)
-    actual = set(parsed_output)
-
-    if actual != expected:
-        raise ValueError(
-            "Gemini 응답 key가 response schema와 일치하지 않습니다. "
-            f"expected={sorted(expected)}, actual={sorted(actual)}"
-        )
-
     validated: dict[str, Any] = {}
 
     string_columns = {
@@ -2072,76 +2513,55 @@ def validate_parsed_output(
         value = parsed_output.get(column_name)
 
         if column_name in string_columns:
-            if value is None:
-                value = ""
-            if not isinstance(value, str):
-                raise ValueError(
-                    "Gemini 응답 값이 문자열이 아닙니다: "
-                    f"{column_name}={value!r}"
-                )
+            string_value = _coerce_response_string(value)
 
             if column_name == "Product":
-                normalized_value = normalize_product_value(value)
+                normalized_value = normalize_product_value(string_value)
             elif column_name == "CXP Product Feature":
-                normalized_value = normalize_cxp_feature_value(value)
+                normalized_value = normalize_cxp_feature_value(string_value)
             elif column_name == "Description":
-                normalized_value = normalize_description_value(value)
+                normalized_value = normalize_description_value(string_value)
             else:
-                normalized_value = " ".join(value.split())
+                normalized_value = " ".join(string_value.split())
 
             validated[column_name] = normalized_value
             continue
 
         if column_name == "Publisher Type":
-            if not isinstance(value, str):
-                raise ValueError(
-                    "Publisher Type은 문자열이어야 합니다: "
-                    f"{value!r}"
-                )
-            publisher_type = value.strip().upper()
+            publisher_type = _coerce_response_string(value).strip().upper()
+
+            # 누락/비정상 값 때문에 행 전체를 버리지 않고 UNKNOWN으로 보존한다.
             if publisher_type not in ALLOWED_PUBLISHER_TYPES:
-                raise ValueError(
-                    "Publisher Type 값이 허용 목록에 없습니다: "
-                    f"{publisher_type!r}"
-                )
+                publisher_type = "UNKNOWN"
+
             validated[column_name] = publisher_type
             continue
 
         if column_name == "Publisher Classification Confidence":
             try:
-                confidence = int(value)
-            except (TypeError, ValueError) as exc:
-                raise ValueError(
-                    "Publisher Classification Confidence를 정수로 "
-                    f"변환할 수 없습니다: {value!r}"
-                ) from exc
-            if not 0 <= confidence <= 100:
-                raise ValueError(
-                    "Publisher Classification Confidence는 0~100이어야 합니다: "
-                    f"{confidence}"
-                )
-            validated[column_name] = confidence
+                confidence = int(float(value))
+            except (TypeError, ValueError):
+                confidence = 0
+
+            validated[column_name] = max(0, min(100, confidence))
             continue
 
         if column_name == "Requires Manual Review":
             if isinstance(value, bool):
                 manual_review = value
+            elif isinstance(value, (int, float)):
+                manual_review = bool(value)
             elif isinstance(value, str):
                 normalized = value.strip().lower()
-                if normalized in {"true", "1", "yes", "y"}:
+                if normalized in {"true", "1", "yes", "y", "t"}:
                     manual_review = True
-                elif normalized in {"false", "0", "no", "n"}:
+                elif normalized in {"false", "0", "no", "n", "f"}:
                     manual_review = False
                 else:
-                    raise ValueError(
-                        "Requires Manual Review 값을 bool로 해석할 수 없습니다: "
-                        f"{value!r}"
-                    )
+                    manual_review = True
             else:
-                raise ValueError(
-                    "Requires Manual Review는 boolean이어야 합니다: "
-                    f"{value!r}"
-                )
+                manual_review = True
+
             validated[column_name] = manual_review
             continue
 
@@ -2161,6 +2581,8 @@ def parse_structured_response(
     response: Any,
     response_schema: dict[str, Any],
 ) -> dict[str, Any]:
+    """Gemini 응답을 정상 structured output → JSON → 필드별 복구 순서로 읽는다."""
+
     parsed = getattr(response, "parsed", None)
     parsed_output: dict[str, Any] | None = None
 
@@ -2182,22 +2604,56 @@ def parse_structured_response(
         if response_text is None:
             raise ValueError("Gemini 응답 text가 비어 있습니다.")
 
-        try:
-            loaded = json.loads(response_text)
-        except json.JSONDecodeError as exc:
-            head = response_text[:700]
-            tail = response_text[-300:] if len(response_text) > 700 else ""
-            raise ValueError(
-                "Gemini 응답을 JSON으로 파싱하지 못했습니다. "
-                f"length={len(response_text)}, "
-                f"head={head!r}, tail={tail!r}"
-            ) from exc
+        cleaned_response_text = _strip_json_code_fence(response_text)
 
-        if not isinstance(loaded, dict):
-            raise ValueError(
-                "Gemini structured response가 JSON object가 아닙니다."
+        # 1. 정상 JSON object
+        try:
+            loaded = json.loads(cleaned_response_text)
+        except json.JSONDecodeError:
+            loaded = None
+
+        if isinstance(loaded, dict):
+            parsed_output = loaded
+
+        # 2. 앞뒤에 설명 문구가 붙은 완전한 JSON object
+        if parsed_output is None:
+            first_brace_index = cleaned_response_text.find("{")
+
+            if first_brace_index >= 0:
+                try:
+                    loaded, _ = json.JSONDecoder().raw_decode(
+                        cleaned_response_text[first_brace_index:]
+                    )
+                except json.JSONDecodeError:
+                    loaded = None
+
+                if isinstance(loaded, dict):
+                    parsed_output = loaded
+
+        # 3. JSON 자체가 중간에 잘렸거나 문법이 깨진 경우 필드별 salvage
+        if parsed_output is None:
+            recovered = extract_fields_from_raw_response(
+                response_text=cleaned_response_text,
+                response_schema=response_schema,
             )
-        parsed_output = loaded
+
+            if recovered:
+                parsed_output = recovered
+
+        # 기대 필드를 하나도 회수하지 못한 경우에만 기존처럼 실패시켜 retry한다.
+        if parsed_output is None:
+            head = cleaned_response_text[:700]
+            tail = (
+                cleaned_response_text[-300:]
+                if len(cleaned_response_text) > 700
+                else ""
+            )
+            raise ValueError(
+                "Gemini 응답에서 response schema 필드를 하나도 복구하지 "
+                "못했습니다. "
+                f"length={len(cleaned_response_text)}, "
+                f"head={head!r}, tail={tail!r}"
+            )
 
     return validate_parsed_output(parsed_output, response_schema)
 
@@ -2421,6 +2877,10 @@ def initialize_result_dataframe(
 ) -> pd.DataFrame:
     output_columns = response_output_columns(prompt_bundle.response_schema)
 
+    deterministic_output_columns = [
+        TARGET_GIVEAWAY_COLUMN,
+    ]
+
     management_columns = [
         "api_status",
         "api_error_message",
@@ -2453,7 +2913,11 @@ def initialize_result_dataframe(
 
     collisions = sorted(
         set(input_dataframe.columns)
-        & (set(management_columns) | set(output_columns))
+        & (
+            set(management_columns)
+            | set(output_columns)
+            | set(deterministic_output_columns)
+        )
     )
     if collisions:
         raise ValueError(
@@ -2462,7 +2926,11 @@ def initialize_result_dataframe(
         )
 
     result_dataframe = input_dataframe.copy()
-    for column in management_columns + output_columns:
+    for column in (
+        management_columns
+        + output_columns
+        + deterministic_output_columns
+    ):
         result_dataframe[column] = pd.NA
 
     return result_dataframe
@@ -2512,6 +2980,13 @@ def write_call_result_to_dataframe(
                     call_result.parsed_output.get(output_column)
                 )
             )
+
+        result_dataframe.at[
+            row_index,
+            TARGET_GIVEAWAY_COLUMN,
+        ] = derive_giveaway_value(
+            call_result.parsed_output.get("Description")
+        )
 
 
 def run_llm_pipeline(
@@ -3348,6 +3823,9 @@ def write_output_values_to_target_row(
     }
     writeback_values.update(
         {
+            TARGET_GIVEAWAY_COLUMN: derive_giveaway_value(
+                result_row.get("Description")
+            ),
             TARGET_SUBSIDIARY_COLUMN: (
                 publisher_decision.subsidiary_display_value
             ),

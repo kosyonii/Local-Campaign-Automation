@@ -19,6 +19,7 @@ from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 import pandas as pd
 from openpyxl import load_workbook
 from openpyxl.worksheet.worksheet import Worksheet
+from dotenv import load_dotenv
 
 
 # =========================================================
@@ -27,6 +28,14 @@ from openpyxl.worksheet.worksheet import Worksheet
 
 BASE_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = BASE_DIR.parent
+ENV_FILE = PROJECT_ROOT / ".env"
+
+# 프로젝트 전체가 사용하는 루트 .env를 공통 설정 파일로 사용한다.
+# OS/실행환경에 이미 설정된 환경변수는 덮어쓰지 않는다.
+load_dotenv(
+    dotenv_path=ENV_FILE,
+    override=False,
+)
 
 # 누락 서브 파이프라인 전용 경로
 # 이 파일은 프로젝트 루트의 `누락/` 폴더에 위치한다.
@@ -151,11 +160,6 @@ MIN_AUTO_PUBLISHER_CONFIDENCE = int(
     os.getenv("MIN_AUTO_PUBLISHER_CONFIDENCE", "70")
 )
 
-# v9 프롬프트/스키마: 인플루언서 정보와 Giveaway 리워드 줄을 포함할 수 있다.
-MAX_DESCRIPTION_LENGTH = int(
-    os.getenv("MAX_DESCRIPTION_LENGTH", "180")
-)
-
 # header row를 직접 지정하지 않으면 1~이 값까지 탐색
 TARGET_HEADER_SCAN_MAX_ROWS = 15
 
@@ -169,6 +173,13 @@ GOOGLE_CLOUD_PROJECT = os.getenv(
 GOOGLE_CLOUD_LOCATION = os.getenv(
     "GOOGLE_CLOUD_LOCATION",
     "global",
+)
+GOOGLE_SERVICE_ACCOUNT_FILE = (
+    os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE")
+    or os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+)
+GOOGLE_CLOUD_PLATFORM_SCOPE = (
+    "https://www.googleapis.com/auth/cloud-platform"
 )
 GEMINI_MODEL = os.getenv(
     "GEMINI_MODEL",
@@ -229,7 +240,6 @@ DEFAULT_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
         },
         "Description": {
             "type": "string",
-            "maxLength": MAX_DESCRIPTION_LENGTH,
             "description": (
                 "한국어 보고서형 설명. 일반 게시물은 한 문장으로 작성하고, "
                 "경품 게시물은 본문 다음 줄에 '→ 구체적인 경품 설명' 형식을 "
@@ -579,23 +589,63 @@ def is_unknown_media_input(
 
 def normalize_cxp_feature_value(value: str) -> str:
     """
-    CXP Product Feature 값을 Excel 셀 내부 줄바꿈 형식으로 정규화한다.
+    CXP Product Feature 값을 deterministic하게 정규화한다.
 
-    지원 입력 예:
-        Camera_Horizontal Lock, Camera_Super Steady
-        Camera_Horizontal Lock\nCamera_Super Steady
-        - Camera_Horizontal Lock\n- Camera_Super Steady
+    핵심 규칙
+    ---------------------------------------------------------
+    1. 쉼표 / 세미콜론 / 실제 줄바꿈 / literal "\\n" 모두 지원
+    2. bullet / 번호 목록 기호 제거
+    3. 동일 값 중복 제거
+    4. 일부 명백한 비표준 명칭을 공식 Allowed Value로 교정
+    5. 동일 Category에서 Detail Feature가 하나라도 존재하면
+       해당 Category의 *_General을 반드시 제거
+    6. General/Detail 상호배타 처리 후 최대 3개까지만 유지
 
-    최종 저장 예:
+    예:
+        Design_General
+        Design_Color
+
+        -> Design_Color
+
+        Camera_General
+        Camera_Zoom
         Camera_Horizontal Lock
-        Camera_Super Steady
+
+        -> Camera_Zoom
+           Camera_Horizontal Lock
+
+        AP/Memory_General
+        AP/Memory_AP Performance
+
+        -> AP/Memory_AP Performance
     """
 
-    if not value.strip():
+    if value is None:
         return ""
 
-    # 쉼표, 세미콜론, 실제 줄바꿈을 모두 항목 구분자로 처리
-    raw_items = re.split(r"[\r\n,;]+", value)
+    source_text = str(value).strip()
+    if not source_text:
+        return ""
+
+    # Gemini가 JSON/string 안에서 literal "\\n"을 남기는 경우까지 처리한다.
+    normalized_source = (
+        source_text
+        .replace("\\n", "\n")
+        .replace("\r\n", "\n")
+        .replace("\r", "\n")
+    )
+
+    # 프롬프트에서 이미 확정된 공식 CXP 명칭에 대한
+    # deterministic typo/legacy normalization.
+    exact_aliases = {
+        "AP/Memory_Performance": "AP/Memory_AP Performance",
+        "Camera_Horizon Lock": "Camera_Horizontal Lock",
+    }
+
+    raw_items = re.split(
+        r"[\n,;]+",
+        normalized_source,
+    )
 
     normalized_items: list[str] = []
     seen: set[str] = set()
@@ -610,14 +660,140 @@ def normalize_cxp_feature_value(value: str) -> str:
             item,
         ).strip()
 
-        if not item or item in seen:
+        if not item:
+            continue
+
+        item = exact_aliases.get(
+            item,
+            item,
+        )
+
+        if item in seen:
             continue
 
         seen.add(item)
         normalized_items.append(item)
 
-    # 프롬프트 규칙에 따라 최대 3개까지만 저장
-    return "\n".join(normalized_items[:3])
+    if not normalized_items:
+        return ""
+
+    # ---------------------------------------------------------
+    # SAME-CATEGORY GENERAL / DETAIL EXCLUSIVITY
+    # ---------------------------------------------------------
+    categories_with_detail: set[str] = set()
+
+    parsed_items: list[
+        tuple[str, str | None, str | None]
+    ] = []
+
+    for item in normalized_items:
+        if "_" not in item:
+            parsed_items.append(
+                (
+                    item,
+                    None,
+                    None,
+                )
+            )
+            continue
+
+        category, detail = item.split(
+            "_",
+            1,
+        )
+
+        category = category.strip()
+        detail = detail.strip()
+
+        parsed_items.append(
+            (
+                item,
+                category,
+                detail,
+            )
+        )
+
+        if (
+            category
+            and detail
+            and detail.casefold() != "general"
+        ):
+            categories_with_detail.add(
+                category.casefold()
+            )
+
+    filtered_items: list[str] = []
+
+    for (
+        item,
+        category,
+        detail,
+    ) in parsed_items:
+
+        if (
+            category is not None
+            and detail is not None
+            and detail.casefold() == "general"
+            and category.casefold()
+            in categories_with_detail
+        ):
+            # 같은 Category에 Detail이 있으므로 General 제거.
+            continue
+
+        filtered_items.append(item)
+
+    # General 제거 이후 최대 3개 적용.
+    final_items = filtered_items[:3]
+
+    # ---------------------------------------------------------
+    # POST-CONDITION
+    # ---------------------------------------------------------
+    # General + Detail 공존이 다시 발생하면 fail-closed.
+    # ---------------------------------------------------------
+    final_category_details: dict[str, set[str]] = {}
+
+    for item in final_items:
+        if "_" not in item:
+            continue
+
+        category, detail = item.split(
+            "_",
+            1,
+        )
+
+        category_key = category.strip().casefold()
+        detail_key = detail.strip().casefold()
+
+        if not category_key or not detail_key:
+            continue
+
+        final_category_details.setdefault(
+            category_key,
+            set(),
+        ).add(
+            detail_key
+        )
+
+    conflicts = [
+        category
+        for category, details
+        in final_category_details.items()
+        if (
+            "general" in details
+            and any(
+                detail != "general"
+                for detail in details
+            )
+        )
+    ]
+
+    if conflicts:
+        raise RuntimeError(
+            "CXP General/Detail deterministic normalization 실패: "
+            f"{sorted(conflicts)}"
+        )
+
+    return "\n".join(final_items)
 
 
 
@@ -1632,15 +1808,6 @@ def validate_response_schema(
             f"actual={sorted(publisher_enum)}"
         )
 
-    description_schema = properties["Description"]
-    description_max_length = description_schema.get("maxLength")
-    if description_max_length != MAX_DESCRIPTION_LENGTH:
-        raise ValueError(
-            "Description maxLength가 Python 설정과 일치하지 않습니다: "
-            f"schema={description_max_length}, "
-            f"python={MAX_DESCRIPTION_LENGTH}"
-        )
-
     required = set(schema.get("required") or [])
     if required != expected_columns:
         raise ValueError(
@@ -1999,6 +2166,71 @@ def build_gemini_contents(
 # =========================================================
 
 
+def load_google_service_account_credentials() -> Any:
+    """프로젝트 루트 .env의 Service Account JSON 경로로 인증 객체를 생성한다.
+
+    우선순위:
+        1. GOOGLE_SERVICE_ACCOUNT_FILE
+        2. GOOGLE_APPLICATION_CREDENTIALS
+
+    Google Cloud CLI 로그인이나 로컬 ADC 사전 생성에 의존하지 않는다.
+    """
+
+    try:
+        from google.oauth2 import service_account
+    except ImportError as exc:
+        raise ImportError(
+            "google-auth 패키지가 설치되어 있지 않습니다. "
+            "다음 명령으로 설치하세요: uv pip install google-auth"
+        ) from exc
+
+    credentials_path_text = optional_text(
+        GOOGLE_SERVICE_ACCOUNT_FILE
+    )
+
+    if credentials_path_text is None:
+        raise RuntimeError(
+            "Google Service Account JSON 경로가 설정되지 않았습니다.\n"
+            "프로젝트 루트 .env의 GOOGLE_SERVICE_ACCOUNT_FILE 또는 "
+            "GOOGLE_APPLICATION_CREDENTIALS에 "
+            "Service Account JSON 파일 경로를 설정하세요."
+        )
+
+    expanded_path_text = os.path.expandvars(
+        credentials_path_text
+    )
+    credentials_path = Path(
+        expanded_path_text
+    ).expanduser()
+
+    # 누락 모듈은 `누락/` 아래에 있으므로 상대경로는 프로젝트 루트 기준으로 해석한다.
+    if not credentials_path.is_absolute():
+        credentials_path = (
+            PROJECT_ROOT / credentials_path
+        ).resolve()
+    else:
+        credentials_path = credentials_path.resolve()
+
+    if not credentials_path.is_file():
+        raise FileNotFoundError(
+            "Google Service Account JSON 파일을 찾을 수 없습니다: "
+            f"{credentials_path}"
+        )
+
+    try:
+        return service_account.Credentials.from_service_account_file(
+            str(credentials_path),
+            scopes=[
+                GOOGLE_CLOUD_PLATFORM_SCOPE,
+            ],
+        )
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(
+            "Google Service Account JSON을 인증 정보로 읽지 못했습니다: "
+            f"{credentials_path}"
+        ) from exc
+
+
 def create_genai_client() -> tuple[Any, Any]:
     try:
         from google import genai
@@ -2009,9 +2241,12 @@ def create_genai_client() -> tuple[Any, Any]:
             "다음 명령으로 설치하세요: uv pip install google-genai"
         ) from exc
 
+    credentials = load_google_service_account_credentials()
+
     client_kwargs = {
         "project": GOOGLE_CLOUD_PROJECT,
         "location": GOOGLE_CLOUD_LOCATION,
+        "credentials": credentials,
         "http_options": types.HttpOptions(api_version="v1"),
     }
 
@@ -2057,15 +2292,19 @@ def validate_parsed_output(
     parsed_output: dict[str, Any],
     response_schema: dict[str, Any],
 ) -> dict[str, Any]:
+    
     output_columns = response_output_columns(response_schema)
 
-    expected = set(output_columns)
-    actual = set(parsed_output)
+    expected_keys = set(output_columns)
+    actual_keys = set(parsed_output.keys())
 
-    if actual != expected:
+    if actual_keys != expected_keys:
+        missing_keys = sorted(expected_keys - actual_keys)
+        extra_keys = sorted(actual_keys - expected_keys)
+
         raise ValueError(
             "Gemini 응답 key가 response schema와 일치하지 않습니다. "
-            f"expected={sorted(expected)}, actual={sorted(actual)}"
+            f"missing={missing_keys}, extra={extra_keys}"
         )
 
     validated: dict[str, Any] = {}
@@ -2077,7 +2316,7 @@ def validate_parsed_output(
     }
 
     for column_name in output_columns:
-        value = parsed_output.get(column_name)
+        value = parsed_output[column_name]
 
         if column_name in string_columns:
             if value is None:
@@ -2174,6 +2413,7 @@ def parse_structured_response(
 
     if isinstance(parsed, dict):
         parsed_output = parsed
+
     elif parsed is not None:
         if hasattr(parsed, "model_dump"):
             dumped = parsed.model_dump()
@@ -2185,8 +2425,10 @@ def parse_structured_response(
             if isinstance(dumped, dict):
                 parsed_output = dumped
 
+    # 완전한 JSON object로 퍼싱하지 못한 경우 실패시켜 retry한다. 
     if parsed_output is None:
         response_text = optional_text(getattr(response, "text", None))
+        
         if response_text is None:
             raise ValueError("Gemini 응답 text가 비어 있습니다.")
 

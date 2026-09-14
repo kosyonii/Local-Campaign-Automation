@@ -2,11 +2,11 @@
   "report": "SPRINKSIGHTS",
   "reportingEngine": "LISTENING",
   "timeField": null,
-  "startTime": 1787497200000,
-  "endTime": 1788087600000,
+  "startTime": 1789008300000,
+  "endTime": 1789094759000,
   "timeZone": "Asia/Seoul",
   "page": 0,
-  "pageSize": 300,
+  "pageSize": 20,
   "filters": [
     {
       "dimensionName": "LISTENING_MEDIA_TYPE",
@@ -85,32 +85,10 @@
       }
     },
     {
-      "dimensionName": "LST_THEME_TAG",
-      "filterType": "IN",
-      "values": [
-        "K_26_2H_HTR (ALL)"
-      ],
-      "details": {
-        "displayNameForWarning": "Theme Tag",
-        "USE_SNAPSHOT_VALUE": false,
-        "type": "DIMENSION",
-        "OLD_DIM_NAME": "THEME_TAGS",
-        "HAS_ALERT": false,
-        "nameQueryLookupSupported": "true",
-        "EXIST_FILTER": false,
-        "HAS_TOOLTIP_DATA": true,
-        "reportName": "SPRINKSIGHTS",
-        "reports": [
-          "SPRINKSIGHTS"
-        ],
-        "dataType": "PICKLIST"
-      }
-    },
-    {
       "dimensionName": "QUERY",
       "filterType": "IN",
       "values": [
-        "url: \"x.com/SamsungIndia/\" OR url: \"twitter.com/SamsungIndia/\""
+        "(url: \"x.com/SamsungUS/\" OR url: \"twitter.com/SamsungUS/\" OR url: \"x.com/SamsungMobileUS/\" OR url: \"twitter.com/SamsungMobileUS/\" OR url: \"x.com/SamsungUK/\" OR url: \"twitter.com/SamsungUK/\" OR url: \"x.com/SamsungDE/\" OR url: \"twitter.com/SamsungDE/\" OR url: \"x.com/SamsungFR/\" OR url: \"twitter.com/SamsungFR/\" OR url: \"x.com/SamsungBrasil/\" OR url: \"twitter.com/SamsungBrasil/\" OR url: \"x.com/SamsungAU/\" OR url: \"twitter.com/SamsungAU/\" OR url: \"x.com/samsungID/\" OR url: \"twitter.com/samsungID/\" OR url: \"x.com/SamsungJPN/\" OR url: \"twitter.com/SamsungJPN/\" OR url: \"x.com/SamsungIndia/\" OR url: \"twitter.com/SamsungIndia/\" OR url: \"x.com/SamsungKorea/\" OR url: \"twitter.com/SamsungKorea/\" OR url: \"x.com/SamsungThailand/\" OR url: \"twitter.com/SamsungThailand/\" OR url: \"x.com/SamsungGulf/\" OR url: \"twitter.com/SamsungGulf/\") NOT (url:(\"twitter.com/samsungukraine\" OR \"x.com/samsungukraine\" OR \"twitter.com/SamsungAustin\" OR \"x.com/SamsungAustin\" OR x.com/samsunguks66z OR twitter.com/samsunguks66z))"
       ],
       "details": {
         "displayNameForWarning": "Keyword Query",
@@ -133,8 +111,8 @@
   ],
   "groupBys": [
     {
-      "heading": "MESSAGE_CONTENT_0",
-      "dimensionName": "MESSAGE_CONTENT",
+      "heading": "ES_MESSAGE_ID_0",
+      "dimensionName": "ES_MESSAGE_ID",
       "groupType": "FIELD",
       "details": {},
       "namedFilters": null
@@ -180,11 +158,11 @@
     "Timezone": "Asia/Seoul",
     "translateResponse": "false",
     "fetchUnhealthyAccounts": "false",
-    "widgetId": "6a4f0e05e4827a7750a3d547",
+    "widgetId": "6a9e24e4b97abb2160ae8b18",
     "exportInfo": "false",
     "MARGIN": "false",
-    "dashboardId": "6a31f4e7eb6ecd3d9d42275f",
     "engine": "LISTENING",
+    "dashboardId": "6a31f4e7eb6ecd3d9d42275f",
     "showTotal": "true",
     "chartType": "TABLE",
     "showRolloverTrends": "false",

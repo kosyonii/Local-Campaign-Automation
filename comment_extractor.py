@@ -9,8 +9,8 @@ Local Campaign Automation용 통합 댓글 URL 추출 모듈.
 ------------
 YT : YouTube      -> yt-dlp
 IG : Instagram    -> yt-dlp
-X  : X / Twitter  -> Playwright persistent Microsoft Edge (visible)
-FB : Facebook     -> Playwright persistent Chromium
+X  : X / Twitter  -> Playwright persistent Microsoft Edge (headless, login/failure fallback visible)
+FB : Facebook     -> Playwright persistent Microsoft Edge (headless after login)
 TT : TikTok       -> Playwright + Edge CDP/network response
 
 Public API
@@ -82,16 +82,31 @@ CHANNEL_ALIASES = {
 
 PAGE_TIMEOUT_MS = 45_000
 
-# 첫 로그인 때만 사람이 인증할 수 있게 유지한다.
+# 첫 로그인 또는 로그인 세션 만료 시에만 일반 Microsoft Edge를 띄운다.
+# 로그인 순간에는 Playwright 제어를 완전히 해제하여 Google SSO도 사용할 수 있게 한다.
+# 사용자가 로그인을 완료한 뒤 일반 Edge 창을 닫으면 같은 browser profile을
+# 다시 Playwright headless Edge로 열어 자동 처리를 계속한다.
 INTERACTIVE_LOGIN = True
+INTERACTIVE_LOGIN_TIMEOUT_SECONDS = 600.0
 
-# Facebook 등 기존 browser automation의 기본 headless 설정.
+# Browser automation의 기본 headless 설정.
+# Facebook은 평상시 headless Edge로 실행한다.
+# 로그인 세션이 없거나 만료된 경우에만 Playwright context를 종료하고
+# 일반 Microsoft Edge를 직접 실행하여 최초/재로그인을 진행한다.
 BROWSER_HEADLESS = True
 
-# X / Twitter는 headless Edge에서 X가 HTTP response failure를 반환하는
-# 환경이 확인되어 Microsoft Edge visible mode로 고정한다.
+# X / Twitter도 평상시에는 headless Microsoft Edge로 실행한다.
+# 로그인 세션이 없거나 만료된 경우에만 Playwright context를 종료하고
+# 일반 Microsoft Edge를 직접 실행하여 최초/재로그인을 진행한다.
+# 또한 headless navigation/runtime 자체가 실패하는 경우에는
+# 해당 게시물에 한해 visible Edge fallback을 허용한다.
 X_BROWSER_CHANNEL = "msedge"
-X_HEADLESS = False
+X_HEADLESS = True
+X_VISIBLE_FALLBACK = True
+
+# Facebook도 Playwright가 설치한 Chromium이 아니라
+# Windows에 설치된 Microsoft Edge를 사용한다.
+FB_BROWSER_CHANNEL = "msedge"
 
 # 댓글별 상세 로그(self-comment 제외, 개별 실패 URL 등)는 출력하지 않는다.
 # 전체 작업 종료 시 CommentExtractorSession.close()에서 요약만 출력한다.
@@ -631,8 +646,8 @@ class CommentExtractorSession:
     X / Facebook / TikTok의 Playwright browser context를
     여러 게시물 행에서 재사용한다.
 
-    - X: .x_browser_profile persistent context 1개
-    - FB: .fb_browser_profile persistent context 1개
+    - X: .x_browser_profile persistent Microsoft Edge context 1개
+    - FB: .fb_browser_profile persistent Microsoft Edge context 1개
     - TT: Edge CDP browser/context 연결 1개
     - 각 게시물에서는 page(tab)만 만들고 닫는다.
     - YT / IG는 yt-dlp 기반이므로 이 session을 사용하지 않는다.
@@ -647,7 +662,9 @@ class CommentExtractorSession:
 
         self._playwright = None
         self._x_context = None
+        self._x_context_headless: bool | None = None
         self._fb_context = None
+        self._fb_context_headless: bool | None = None
         self._tt_browser = None
         self._tt_context = None
 
@@ -764,9 +781,43 @@ class CommentExtractorSession:
 
     def get_x_context(
         self,
+        *,
+        headless: bool | None = None,
     ):
+        """
+        X / Twitter 전용 Microsoft Edge persistent context를 반환한다.
+
+        기본적으로 X_HEADLESS 설정을 사용한다.
+        로그인 세션이 없거나 만료된 경우 또는 headless 실행 자체가
+        실패한 경우에는 호출부에서 headless=False로 재호출해
+        visible Edge로 전환할 수 있다.
+
+        동일한 .x_browser_profile을 사용하므로 visible Edge에서
+        생성된 로그인 cookie/session은 이후 headless Edge에서도 재사용된다.
+        """
+
+        desired_headless = (
+            X_HEADLESS
+            if headless is None
+            else bool(headless)
+        )
+
         if self._x_context is not None:
-            return self._x_context
+            if (
+                self._x_context_headless
+                == desired_headless
+            ):
+                return self._x_context
+
+            # 동일 persistent profile은 동시에 두 context에서 열 수 없으므로
+            # 기존 context를 종료한 뒤 headless/visible 모드를 전환한다.
+            try:
+                self._x_context.close()
+            except Exception:
+                pass
+
+            self._x_context = None
+            self._x_context_headless = None
 
         playwright = (
             self._require_playwright()
@@ -784,7 +835,7 @@ class CommentExtractorSession:
                     X_PROFILE_DIR
                 ),
                 channel=X_BROWSER_CHANNEL,
-                headless=X_HEADLESS,
+                headless=desired_headless,
                 viewport={
                     "width": 1440,
                     "height": 1000,
@@ -792,13 +843,47 @@ class CommentExtractorSession:
             )
         )
 
+        self._x_context_headless = desired_headless
+
         return self._x_context
 
     def get_fb_context(
         self,
+        *,
+        headless: bool | None = None,
     ):
+        """
+        Facebook 전용 Microsoft Edge persistent context를 반환한다.
+
+        기본적으로 self.headless 설정을 사용한다.
+        로그인 세션이 없거나 만료된 경우에는 호출부에서
+        headless=False로 재호출하여 visible Edge로 로그인한 뒤,
+        다시 headless=True로 전환할 수 있다.
+
+        동일한 .fb_browser_profile을 사용하므로 visible Edge에서
+        생성된 로그인 cookie/session은 이후 headless Edge에서도 재사용된다.
+        """
+
+        desired_headless = (
+            self.headless
+            if headless is None
+            else bool(headless)
+        )
+
         if self._fb_context is not None:
-            return self._fb_context
+            if (
+                self._fb_context_headless
+                == desired_headless
+            ):
+                return self._fb_context
+
+            try:
+                self._fb_context.close()
+            except Exception:
+                pass
+
+            self._fb_context = None
+            self._fb_context_headless = None
 
         playwright = (
             self._require_playwright()
@@ -815,7 +900,8 @@ class CommentExtractorSession:
                 user_data_dir=str(
                     FB_PROFILE_DIR
                 ),
-                headless=self.headless,
+                channel=FB_BROWSER_CHANNEL,
+                headless=desired_headless,
                 viewport={
                     "width": 1440,
                     "height": 1000,
@@ -823,7 +909,47 @@ class CommentExtractorSession:
             )
         )
 
+        self._fb_context_headless = desired_headless
+
         return self._fb_context
+
+    def close_x_context(
+        self,
+    ) -> None:
+        """
+        X persistent Playwright context만 종료한다.
+
+        일반 Microsoft Edge에서 같은 .x_browser_profile을 사용해
+        로그인해야 할 때 profile lock을 해제하기 위해 사용한다.
+        """
+
+        if self._x_context is not None:
+            try:
+                self._x_context.close()
+            except Exception:
+                pass
+
+        self._x_context = None
+        self._x_context_headless = None
+
+    def close_fb_context(
+        self,
+    ) -> None:
+        """
+        Facebook persistent Playwright context만 종료한다.
+
+        일반 Microsoft Edge에서 같은 .fb_browser_profile을 사용해
+        로그인해야 할 때 profile lock을 해제하기 위해 사용한다.
+        """
+
+        if self._fb_context is not None:
+            try:
+                self._fb_context.close()
+            except Exception:
+                pass
+
+        self._fb_context = None
+        self._fb_context_headless = None
 
     def get_tiktok_context(
         self,
@@ -866,20 +992,8 @@ class CommentExtractorSession:
 
         # X / Facebook은 이 session이 직접 생성한
         # persistent context이므로 종료한다.
-        for context in (
-            self._x_context,
-            self._fb_context,
-        ):
-            if context is None:
-                continue
-
-            try:
-                context.close()
-            except Exception:
-                pass
-
-        self._x_context = None
-        self._fb_context = None
+        self.close_x_context()
+        self.close_fb_context()
 
         # TikTok은 외부 Edge/CDP에 연결한 것이므로
         # browser.close()를 호출하지 않는다.
@@ -947,6 +1061,165 @@ def close_default_comment_extractor_session(
 atexit.register(
     close_default_comment_extractor_session
 )
+
+
+
+def _browser_context_has_cookie(
+    context,
+    cookie_names: set[str],
+) -> bool:
+    """
+    persistent browser context에 지정된 로그인 cookie가 존재하는지 확인한다.
+    """
+
+    try:
+        cookies = context.cookies()
+    except Exception:
+        return False
+
+    for cookie in cookies:
+        try:
+            name = str(
+                cookie.get("name", "")
+            ).strip()
+            value = str(
+                cookie.get("value", "")
+            ).strip()
+        except Exception:
+            continue
+
+        if (
+            name in cookie_names
+            and value
+        ):
+            return True
+
+    return False
+
+
+def _launch_native_edge_for_login(
+    *,
+    profile_dir: Path,
+    login_url: str,
+    platform_label: str,
+) -> bool:
+    """
+    Playwright가 아닌 일반 Microsoft Edge를 직접 실행하여
+    사용자가 최초/재로그인을 수행할 수 있게 한다.
+
+    동일한 persistent profile directory를 사용하므로 로그인 정보는
+    이후 Playwright headless Edge에서도 그대로 재사용된다.
+
+    사용 방법:
+    1) 열린 일반 Edge에서 로그인
+    2) 로그인 완료 후 해당 Edge 창을 직접 닫기
+    3) 함수가 종료되면 caller가 headless Edge로 profile을 다시 연다
+    """
+
+    if not INTERACTIVE_LOGIN:
+        return False
+
+    edge_path = (
+        _find_edge_executable()
+    )
+
+    if edge_path is None:
+        raise RuntimeError(
+            "Microsoft Edge 실행 파일을 찾지 못했습니다."
+        )
+
+    profile_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    print()
+    print(
+        f"[{platform_label}] 로그인이 필요합니다."
+    )
+    print(
+        "일반 Microsoft Edge를 실행합니다."
+    )
+    print(
+        "열린 Edge에서 로그인을 완료한 뒤 "
+        "해당 Edge 창을 직접 닫아주세요."
+    )
+    print(
+        "창을 닫으면 자동으로 headless 모드로 돌아가 "
+        "댓글 추출을 계속합니다."
+    )
+
+    process = subprocess.Popen(
+        [
+            str(edge_path),
+            f"--user-data-dir={profile_dir}",
+            "--new-window",
+            "--no-first-run",
+            "--no-default-browser-check",
+            login_url,
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    try:
+        process.wait(
+            timeout=INTERACTIVE_LOGIN_TIMEOUT_SECONDS
+        )
+    except subprocess.TimeoutExpired:
+        print(
+            f"[{platform_label}] 로그인 대기 시간이 초과되었습니다."
+        )
+        print(
+            "열린 Edge 창을 닫은 뒤 다시 실행해주세요."
+        )
+
+        # 신규 전용 profile로 띄운 로그인 Edge만 종료를 시도한다.
+        try:
+            process.terminate()
+        except Exception:
+            pass
+
+        return False
+
+    # Edge가 profile state를 디스크에 flush할 시간을 짧게 확보한다.
+    time.sleep(
+        1.5
+    )
+
+    return True
+
+
+def _verify_login_cookie_after_native_edge(
+    *,
+    context,
+    cookie_names: set[str],
+    platform_label: str,
+) -> bool:
+    """
+    일반 Edge 종료 후 Playwright context에서 login cookie 저장 여부를 확인한다.
+    """
+
+    logged_in = (
+        _browser_context_has_cookie(
+            context,
+            cookie_names,
+        )
+    )
+
+    if logged_in:
+        print(
+            f"[{platform_label}] 로그인 세션 확인 완료."
+        )
+        return True
+
+    print(
+        f"[{platform_label}] 로그인 세션을 확인하지 못했습니다."
+    )
+    print(
+        "로그인을 완료한 뒤 Edge 창을 닫았는지 확인해주세요."
+    )
+    return False
 
 
 # =============================================================================
@@ -1086,59 +1359,35 @@ def _x_requires_login(
     return (
         "/i/flow/login" in current_url
         or "/login" in current_url
+        or "/account/access" in current_url
+    )
+
+
+def _x_context_is_logged_in(
+    context,
+) -> bool:
+    # X의 authenticated session을 나타내는 핵심 cookie.
+    return _browser_context_has_cookie(
+        context,
+        {"auth_token"},
     )
 
 
 def _x_handle_login(
-    page,
-    post_url: str,
     *,
-    headless: bool = False,
+    active_session: CommentExtractorSession,
 ) -> bool:
-    if not _x_requires_login(
-        page
-    ):
-        return True
+    """
+    X 로그인 시 Playwright context를 완전히 종료하고
+    일반 Microsoft Edge를 직접 실행한다.
+    """
 
-    if headless:
-        print()
-        print(
-            "[X] 로그인 세션이 필요하지만 현재 headless 모드입니다."
-        )
-        print(
-            "X는 visible Edge로 실행하도록 설정되어 있습니다. "
-            "X_HEADLESS 설정을 확인하세요."
-        )
-        return False
+    active_session.close_x_context()
 
-    if not INTERACTIVE_LOGIN:
-        return False
-
-    print()
-    print(
-        "[X] 최초 로그인이 필요합니다."
-    )
-    print(
-        "열린 Microsoft Edge에서 로그인한 뒤 "
-        "터미널로 돌아와 Enter를 누르세요."
-    )
-
-    input(
-        "로그인 완료 후 Enter: "
-    )
-
-    page.goto(
-        post_url,
-        wait_until="domcontentloaded",
-        timeout=PAGE_TIMEOUT_MS,
-    )
-
-    page.wait_for_timeout(
-        3_000
-    )
-
-    return not _x_requires_login(
-        page
+    return _launch_native_edge_for_login(
+        profile_dir=X_PROFILE_DIR,
+        login_url="https://x.com/i/flow/login",
+        platform_label="X",
     )
 
 
@@ -1197,11 +1446,106 @@ def _x_find_consumer_reply_url(
     return None
 
 
+def _x_load_post(
+    page,
+    post_url: str,
+) -> None:
+    """
+    X 게시물 페이지를 로드한다.
+
+    HTTP 4xx/5xx response가 명시적으로 반환되면 headless 환경 자체의
+    navigation 실패로 간주하여 caller가 visible fallback을 시도할 수 있도록
+    RuntimeError를 발생시킨다.
+    """
+
+    page.set_default_timeout(
+        10_000
+    )
+
+    response = page.goto(
+        post_url,
+        wait_until="domcontentloaded",
+        timeout=PAGE_TIMEOUT_MS,
+    )
+
+    page.wait_for_timeout(
+        3_000
+    )
+
+    if (
+        response is not None
+        and response.status >= 400
+    ):
+        raise RuntimeError(
+            "X 게시물 navigation HTTP 오류: "
+            f"{response.status}"
+        )
+
+
+def _x_extract_consumer_reply_from_page(
+    page,
+    *,
+    original_username: str,
+    original_tweet_id: str,
+) -> str | None:
+    """
+    현재 열린 X 게시물에서 첫 번째 소비자 reply URL을 찾는다.
+    기존 self-reply 제외 및 스크롤 정책을 그대로 유지한다.
+    """
+
+    seen_ids: set[str] = set()
+
+    for _ in range(6):
+        page.wait_for_timeout(
+            1_500
+        )
+
+        result = (
+            _x_find_consumer_reply_url(
+                page=page,
+                original_username=(
+                    original_username
+                ),
+                original_tweet_id=(
+                    original_tweet_id
+                ),
+                seen_ids=seen_ids,
+            )
+        )
+
+        if result:
+            return result
+
+        page.mouse.wheel(
+            0,
+            1400,
+        )
+
+    return None
+
+
 def extract_twitter_comment_url(
     post_url: str,
     *,
     session: CommentExtractorSession | None = None,
 ) -> str | None:
+    """
+    X / Twitter 댓글 URL 추출.
+
+    정상 운영:
+    - headless Microsoft Edge + .x_browser_profile
+
+    로그인 세션 없음/만료:
+    - Playwright context 종료
+    - 일반 Microsoft Edge 직접 실행
+    - 사용자가 Google SSO 등을 포함하여 직접 로그인
+    - 사용자가 Edge 창을 닫으면 동일 profile을 headless로 재오픈
+    - auth_token cookie 확인 후 자동 처리 계속
+
+    X가 headless navigation/runtime을 거부하는 경우:
+    - 이미 로그인된 세션에 한해 해당 게시물만 Playwright visible Edge fallback
+    """
+
     try:
         from playwright.sync_api import (
             Error as PlaywrightError,
@@ -1224,85 +1568,211 @@ def extract_twitter_comment_url(
         or get_default_comment_extractor_session()
     )
 
-    context = (
-        active_session.get_x_context()
-    )
-
-    page = context.new_page()
+    page = None
+    context = None
+    headless_failed = False
 
     try:
-        page.set_default_timeout(
-            10_000
-        )
-
-        page.goto(
-            post_url,
-            wait_until="domcontentloaded",
-            timeout=PAGE_TIMEOUT_MS,
-        )
-
-        page.wait_for_timeout(
-            3_000
-        )
-
-        if not _x_handle_login(
-            page=page,
-            post_url=post_url,
-            headless=X_HEADLESS,
-        ):
-            return None
-
-        seen_ids: set[str] = set()
-
-        for _ in range(6):
-            page.wait_for_timeout(
-                1_500
+        # -------------------------------------------------------------
+        # 1. 평상시에는 headless Edge로 시작
+        # -------------------------------------------------------------
+        context = (
+            active_session.get_x_context(
+                headless=True,
             )
+        )
 
-            result = (
-                _x_find_consumer_reply_url(
-                    page=page,
-                    original_username=(
-                        original_username
-                    ),
-                    original_tweet_id=(
-                        original_tweet_id
-                    ),
-                    seen_ids=seen_ids,
+        page = context.new_page()
+
+        try:
+            _x_load_post(
+                page=page,
+                post_url=post_url,
+            )
+        except (
+            PlaywrightTimeoutError,
+            PlaywrightError,
+            RuntimeError,
+        ):
+            headless_failed = True
+
+        login_required = (
+            not _x_context_is_logged_in(
+                context
+            )
+            or (
+                page is not None
+                and _x_requires_login(
+                    page
+                )
+            )
+        )
+
+        # -------------------------------------------------------------
+        # 2. 로그인 필요 시 Playwright를 끊고 일반 Edge로 로그인
+        # -------------------------------------------------------------
+        if login_required:
+            if page is not None:
+                try:
+                    page.close()
+                except Exception:
+                    pass
+                page = None
+
+            if not _x_handle_login(
+                active_session=active_session,
+            ):
+                return None
+
+            # Native Edge 종료 후 동일 profile을 다시 headless로 연다.
+            context = (
+                active_session.get_x_context(
+                    headless=True,
                 )
             )
 
-            if result:
-                return result
+            if not _verify_login_cookie_after_native_edge(
+                context=context,
+                cookie_names={"auth_token"},
+                platform_label="X",
+            ):
+                return None
 
-            page.mouse.wheel(
-                0,
-                1400,
+            page = context.new_page()
+
+            try:
+                _x_load_post(
+                    page=page,
+                    post_url=post_url,
+                )
+                headless_failed = False
+            except (
+                PlaywrightTimeoutError,
+                PlaywrightError,
+                RuntimeError,
+            ):
+                headless_failed = True
+
+        # -------------------------------------------------------------
+        # 3. headless 자체가 X에서 실패한 경우 visible fallback
+        #    로그인은 이미 Native Edge에서 완료된 상태여야 한다.
+        # -------------------------------------------------------------
+        if headless_failed:
+            if not X_VISIBLE_FALLBACK:
+                return None
+
+            if page is not None:
+                try:
+                    page.close()
+                except Exception:
+                    pass
+                page = None
+
+            context = (
+                active_session.get_x_context(
+                    headless=False,
+                )
             )
 
-        return None
+            page = context.new_page()
+
+            try:
+                _x_load_post(
+                    page=page,
+                    post_url=post_url,
+                )
+            except (
+                PlaywrightTimeoutError,
+                PlaywrightError,
+                RuntimeError,
+            ):
+                return None
+
+            # visible fallback 중 session이 만료되었다면
+            # 다시 Native Edge 로그인 방식으로 복구한다.
+            if (
+                not _x_context_is_logged_in(
+                    context
+                )
+                or _x_requires_login(
+                    page
+                )
+            ):
+                try:
+                    page.close()
+                except Exception:
+                    pass
+                page = None
+
+                if not _x_handle_login(
+                    active_session=active_session,
+                ):
+                    return None
+
+                # X는 headless가 실패했던 게시물이므로
+                # 로그인 후 visible Playwright Edge로 다시 연다.
+                context = (
+                    active_session.get_x_context(
+                        headless=False,
+                    )
+                )
+
+                if not _verify_login_cookie_after_native_edge(
+                    context=context,
+                    cookie_names={"auth_token"},
+                    platform_label="X",
+                ):
+                    return None
+
+                page = context.new_page()
+
+                try:
+                    _x_load_post(
+                        page=page,
+                        post_url=post_url,
+                    )
+                except (
+                    PlaywrightTimeoutError,
+                    PlaywrightError,
+                    RuntimeError,
+                ):
+                    return None
+
+        # -------------------------------------------------------------
+        # 4. 기존 댓글 탐색 / self-reply 제외 로직
+        # -------------------------------------------------------------
+        return (
+            _x_extract_consumer_reply_from_page(
+                page=page,
+                original_username=(
+                    original_username
+                ),
+                original_tweet_id=(
+                    original_tweet_id
+                ),
+            )
+        )
 
     except (
         PlaywrightTimeoutError,
         PlaywrightError,
     ):
-        # 특정 X 게시물의 navigation/runtime 실패가
-        # 전체 pipeline을 중단시키지 않도록 미추출로 처리한다.
         return None
 
     finally:
-        # BrowserContext는 전체 작업 동안 재사용하고,
-        # 이 게시물용 tab만 닫는다.
-        try:
-            page.close()
-        except Exception:
-            pass
+        if page is not None:
+            try:
+                page.close()
+            except Exception:
+                pass
 
 
 # =============================================================================
 # Facebook
 # =============================================================================
 
+# Facebook 전용 Microsoft Edge persistent profile.
+# 신규 PC에서는 첫 Facebook browser automation 실행 시 자동 생성된다.
 FB_PROFILE_DIR = (
     PROJECT_ROOT
     / ".fb_browser_profile"
@@ -1888,56 +2358,31 @@ def _fb_requires_login(
         return False
 
 
-def _fb_handle_login(
-    page,
-    post_url: str,
-    *,
-    headless: bool = False,
+def _fb_context_is_logged_in(
+    context,
 ) -> bool:
-    if not _fb_requires_login(
-        page
-    ):
-        return True
-
-    if headless:
-        print()
-        print(
-            "[FB] 로그인 세션이 필요하지만 현재 headless 모드입니다."
-        )
-        print(
-            "최초 인증이 필요한 경우 BROWSER_HEADLESS=False로 "
-            "1회 로그인한 뒤 다시 headless 모드로 실행하세요."
-        )
-        return False
-
-    if not INTERACTIVE_LOGIN:
-        return False
-
-    print()
-    print(
-        "[FB] 최초 로그인이 필요합니다."
-    )
-    print(
-        "열린 Chromium에서 로그인한 뒤 "
-        "터미널로 돌아와 Enter를 누르세요."
+    # Facebook 로그인 session의 대표 cookie.
+    return _browser_context_has_cookie(
+        context,
+        {"c_user"},
     )
 
-    input(
-        "로그인 완료 후 Enter: "
-    )
 
-    page.goto(
-        post_url,
-        wait_until="domcontentloaded",
-        timeout=PAGE_TIMEOUT_MS,
-    )
+def _fb_handle_login(
+    *,
+    active_session: CommentExtractorSession,
+) -> bool:
+    """
+    Facebook 로그인 시 Playwright context를 완전히 종료하고
+    일반 Microsoft Edge를 직접 실행한다.
+    """
 
-    page.wait_for_timeout(
-        4_000
-    )
+    active_session.close_fb_context()
 
-    return not _fb_requires_login(
-        page
+    return _launch_native_edge_for_login(
+        profile_dir=FB_PROFILE_DIR,
+        login_url="https://www.facebook.com/login/",
+        platform_label="FB",
     )
 
 
@@ -2039,13 +2484,20 @@ def extract_facebook_comment_url(
         or get_default_comment_extractor_session()
     )
 
-    context = (
-        active_session.get_fb_context()
-    )
-
-    page = context.new_page()
+    page = None
 
     try:
+        # -------------------------------------------------------------
+        # 1. 평상시에는 headless Microsoft Edge
+        # -------------------------------------------------------------
+        context = (
+            active_session.get_fb_context(
+                headless=True,
+            )
+        )
+
+        page = context.new_page()
+
         page.set_default_timeout(
             10_000
         )
@@ -2060,13 +2512,68 @@ def extract_facebook_comment_url(
             4_000
         )
 
-        if not _fb_handle_login(
-            page=page,
-            post_url=post_url,
-            headless=active_session.headless,
-        ):
-            return None
+        login_required = (
+            not _fb_context_is_logged_in(
+                context
+            )
+            or _fb_requires_login(
+                page
+            )
+        )
 
+        # -------------------------------------------------------------
+        # 2. 로그인 필요 시 Playwright를 끊고 일반 Edge로 로그인
+        # -------------------------------------------------------------
+        if login_required:
+            try:
+                page.close()
+            except Exception:
+                pass
+            page = None
+
+            if not _fb_handle_login(
+                active_session=active_session,
+            ):
+                return None
+
+            # Native Edge 종료 후 동일 profile을 다시 headless로 연다.
+            context = (
+                active_session.get_fb_context(
+                    headless=True,
+                )
+            )
+
+            if not _verify_login_cookie_after_native_edge(
+                context=context,
+                cookie_names={"c_user"},
+                platform_label="FB",
+            ):
+                return None
+
+            page = context.new_page()
+
+            page.set_default_timeout(
+                10_000
+            )
+
+            page.goto(
+                post_url,
+                wait_until="domcontentloaded",
+                timeout=PAGE_TIMEOUT_MS,
+            )
+
+            page.wait_for_timeout(
+                4_000
+            )
+
+            if _fb_requires_login(
+                page
+            ):
+                return None
+
+        # -------------------------------------------------------------
+        # 3. 기존 Facebook 댓글 탐색 / self-comment 제외 로직
+        # -------------------------------------------------------------
         for _ in range(10):
             _fb_try_expand_comments(
                 page
@@ -2103,12 +2610,11 @@ def extract_facebook_comment_url(
         return None
 
     finally:
-        # BrowserContext는 전체 작업 동안 재사용하고,
-        # 이 게시물용 tab만 닫는다.
-        try:
-            page.close()
-        except Exception:
-            pass
+        if page is not None:
+            try:
+                page.close()
+            except Exception:
+                pass
 
 
 # =============================================================================

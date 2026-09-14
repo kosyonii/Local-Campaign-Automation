@@ -5,7 +5,6 @@ from datetime import date, datetime
 import json
 import os
 from pathlib import Path
-import shutil
 import subprocess
 import sys
 from typing import Callable, Literal
@@ -252,157 +251,8 @@ def ensure_buzz_volume_directories() -> tuple[Path, Path]:
     )
 
 
-def _build_gcloud_command(
-    gcloud_path: str,
-    *arguments: str,
-) -> list[str]:
-    """
-    현재 OS에서 gcloud 명령을 안정적으로 실행할 command list를 만든다.
-
-    Windows에서는 gcloud가 gcloud.cmd / gcloud.bat 형태일 수 있으므로
-    cmd.exe를 통해 실행한다.
-    """
-
-    suffix = Path(gcloud_path).suffix.casefold()
-
-    if os.name == "nt" and suffix in {
-        ".cmd",
-        ".bat",
-    }:
-        return [
-            "cmd.exe",
-            "/d",
-            "/c",
-            gcloud_path,
-            *arguments,
-        ]
-
-    return [
-        gcloud_path,
-        *arguments,
-    ]
 
 
-def ensure_google_adc(
-    *,
-    log_callback: LogCallback | None = None,
-) -> None:
-    """
-    Google Application Default Credentials(ADC)를 확인한다.
-
-    처리 순서:
-    1. 현재 ADC로 access token 발급 가능 여부 확인
-    2. 정상이라면 그대로 pipeline 진행
-    3. ADC가 없거나 만료되었다면
-       `gcloud auth application-default login` 자동 실행
-    4. 로그인 완료 후 ADC를 다시 검증
-    """
-
-    gcloud_path = shutil.which(
-        "gcloud"
-    )
-
-    if not gcloud_path:
-        raise RuntimeError(
-            "gcloud CLI를 찾을 수 없습니다.\n"
-            "Google Cloud SDK가 설치되어 있고 "
-            "PATH에 등록되어 있는지 확인하세요."
-        )
-
-    _emit_log(
-        log_callback=log_callback,
-    )
-    _emit_log(
-        "=" * 70,
-        log_callback=log_callback,
-    )
-    _emit_log(
-        "Google Cloud 인증 확인",
-        log_callback=log_callback,
-    )
-    _emit_log(
-        "=" * 70,
-        log_callback=log_callback,
-    )
-
-    check_result = subprocess.run(
-        _build_gcloud_command(
-            gcloud_path,
-            "auth",
-            "application-default",
-            "print-access-token",
-        ),
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        check=False,
-        cwd=PROJECT_ROOT,
-    )
-
-    if check_result.returncode == 0:
-        _emit_log(
-            "✅ Google Cloud Application Default Credentials 정상",
-            log_callback=log_callback,
-        )
-        return
-
-    _emit_log(
-        "Google Cloud 인증이 없거나 만료되었습니다.",
-        log_callback=log_callback,
-    )
-    _emit_log(
-        "gcloud auth application-default login을 실행합니다.",
-        log_callback=log_callback,
-    )
-    _emit_log(
-        log_callback=log_callback,
-    )
-
-    login_result = subprocess.run(
-        _build_gcloud_command(
-            gcloud_path,
-            "auth",
-            "application-default",
-            "login",
-        ),
-        check=False,
-        cwd=PROJECT_ROOT,
-    )
-
-    if login_result.returncode != 0:
-        raise RuntimeError(
-            "Google Cloud Application Default Credentials "
-            "로그인에 실패했습니다.\n"
-            f"gcloud return code: "
-            f"{login_result.returncode}"
-        )
-
-    verify_result = subprocess.run(
-        _build_gcloud_command(
-            gcloud_path,
-            "auth",
-            "application-default",
-            "print-access-token",
-        ),
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        check=False,
-        cwd=PROJECT_ROOT,
-    )
-
-    if verify_result.returncode != 0:
-        raise RuntimeError(
-            "Google Cloud 로그인은 완료되었지만 "
-            "Application Default Credentials 검증에 "
-            "실패했습니다."
-        )
-
-    _emit_log(
-        log_callback=log_callback,
-    )
-    _emit_log(
-        "✅ Google Cloud Application Default Credentials 인증 완료",
-        log_callback=log_callback,
-    )
 
 
 def parse_datetime(
@@ -706,11 +556,6 @@ def run_local_campaign_pipeline(
     CLI(run_pipeline.py)와 향후 Web UI(streamlit_app.py)가
     이 함수를 동일하게 호출한다.
     """
-
-    if check_google_adc:
-        ensure_google_adc(
-            log_callback=log_callback,
-        )
 
     (
         buzz_volume_root,
@@ -1265,14 +1110,6 @@ def run_single_module(
         module_inputs = [
             normalized_date
         ]
-
-    if (
-        check_google_adc
-        and module_name == "llm_analysis_pipeline.py"
-    ):
-        ensure_google_adc(
-            log_callback=log_callback,
-        )
 
     module_arguments: list[str] = []
 
@@ -2100,11 +1937,6 @@ def run_missing_cases_pipeline(
         raise RuntimeError(
             "누락건 실행 환경 검증에 실패했습니다.\n"
             + details
-        )
-
-    if check_google_adc:
-        ensure_google_adc(
-            log_callback=log_callback,
         )
 
     (
