@@ -8,6 +8,9 @@ import json
 import os
 import re
 import shutil
+import time
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -15,12 +18,13 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import pandas as pd
-import requests
 
 from openpyxl import load_workbook, Workbook
 from openpyxl.utils.dataframe import dataframe_to_rows
 
 from dotenv import load_dotenv
+
+import sprinklr_rate_limiter
 
 CODE_VERSION = "20260903_ROOT_HASMORE_HEADINGS_ONLY_V3"
 print(f"[SPRINKLR EXPORT LOADED] {CODE_VERSION}")
@@ -122,6 +126,31 @@ WIDGET_CONFIGS = [
         "payload_path": PAYLOAD_DIR / "payload_5_1_minigame_fb.json",
     },
 ]
+
+# =========================================================
+# Widget 병렬 호출 설정
+# =========================================================
+# Widget 간에는 서로 독립적이므로 동시에 호출한다.
+# (Widget 내부 hasMore pagination은 커서 의존이라 계속 순차 처리한다.)
+# Excel 쓰기는 openpyxl이 thread-safe가 아니므로 main()에서 항상
+# WIDGET_CONFIGS 순서대로 메인 스레드에서만 수행한다.
+MAX_WIDGET_WORKERS = len(WIDGET_CONFIGS)
+
+# 2026-09-23 실측 결과, "900회/시간을 60초 창으로 분산"(15회/60초)은
+# 이번 위젯 세트(주간 데이터컷 기준 총 호출 약 31회)에는 과도하게
+# 보수적이어서 오히려 순차 버전보다 느려졌다(127.55s vs 순차 102.26s).
+# 실제 위험은 시간당 누적 호출량이 아니라, 12개 위젯이 동시에 첫
+# 요청을 쏘는 순간의 초단위 burst였다(Sprinklr 403 Developer Over
+# Rate 실측 2건). 따라서 시간당 한도가 아니라 "동시 burst 완화"만
+# 목표로 창을 짧게 잡는다: 위젯 수만큼(12)을 5초 창에 허용.
+# Sprinklr 시간당 한도(1,000회)와는 여전히 거리가 먼 수준이라 안전하다.
+WIDGET_RATE_LIMIT_MAX_CALLS_PER_WINDOW = MAX_WIDGET_WORKERS
+WIDGET_RATE_LIMIT_WINDOW_SECONDS = 5.0
+
+RATE_LIMITER = sprinklr_rate_limiter.SlidingWindowRateLimiter(
+    max_calls=WIDGET_RATE_LIMIT_MAX_CALLS_PER_WINDOW,
+    period_seconds=WIDGET_RATE_LIMIT_WINDOW_SECONDS,
+)
 
 # =========================================================
 # Raw Data 시트 컬럼 구성
@@ -820,47 +849,10 @@ def update_payload_time_range(
 # =========================================================
 # 7. Sprinklr API 호출
 # =========================================================
-
-def fetch_sprinklr_data(
-    base_url: str,
-    endpoint: str,
-    api_key: str,
-    access_token: str,
-    payload: dict
-) -> dict:
-    if not api_key:
-        raise ValueError("API_KEY is missing. Check SPRINKLR_API_KEY environment variable.")
-
-    if not access_token:
-        raise ValueError("ACCESS_TOKEN is missing. Check SPRINKLR_ACCESS_TOKEN environment variable.")
-
-    url = f"{base_url}{endpoint}"
-
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Key": api_key,
-        "Content-Type": "application/json",
-    }
-
-    response = requests.post(
-        url,
-        headers=headers,
-        json=payload,
-        timeout=(10, 180)
-    )
-
-    # HTTP error 발생 시 여기서 에러 발생
-    try:
-        response.raise_for_status()
-    except requests.exceptions.HTTPError:
-        print("HTTP status:", response.status_code)
-        print("Request URL:", url)
-        print("Response text:")
-        print(response.text[:3000])
-        raise
-
-    return response.json()
-
+# 실제 HTTP 호출 + 429/403(Developer Over Rate) 재시도 +
+# rate limiting은 sprinklr_rate_limiter.fetch_sprinklr_data_with_retry()가
+# 담당한다. 위젯 병렬 호출 시 여러 스레드가 이 함수를 동시에 호출하며,
+# RATE_LIMITER 인스턴스를 공유해 전체 호출 속도를 함께 제한한다.
 
 # =========================================================
 # 7.1. Sprinklr hasMore pagination
@@ -1141,6 +1133,41 @@ def get_response_row_count(
     return len(rows)
 
 
+# =========================================================
+# 7.2. 위젯 호출 구간(fetch 시작~종료) 타이머 로그
+# =========================================================
+# 순차 버전과 향후 병렬 버전이 동일 포맷으로 로그를 남겨야
+# 두 실행의 소요시간을 phase_end elapsed_sec 값으로 직접
+# 비교할 수 있다. Excel 쓰기 / DataFrame 변환은 이 타이머에
+# 포함하지 않는다.
+
+def log_widget_call_timer(
+    *,
+    event: str,
+    widget_name: str | None = None,
+    elapsed_seconds: float | None = None,
+) -> None:
+    wall_time = datetime.now(
+        ZoneInfo("Asia/Seoul")
+    ).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+
+    parts = [
+        "[WIDGET_CALL_TIMER]",
+        f"event={event}",
+    ]
+
+    if widget_name is not None:
+        parts.append(f'widget="{widget_name}"')
+
+    parts.append(f"wall_time={wall_time}")
+
+    if elapsed_seconds is not None:
+        parts.append(f"elapsed_sec={elapsed_seconds:.2f}")
+
+    # 병렬 실행 시 여러 스레드가 동시에 로그를 남기므로 락으로 보호한다.
+    sprinklr_rate_limiter.safe_print(" ".join(parts))
+
+
 def fetch_all_sprinklr_pages(
     base_url: str,
     endpoint: str,
@@ -1148,6 +1175,7 @@ def fetch_all_sprinklr_pages(
     access_token: str,
     payload: dict,
     widget_name: str,
+    rate_limiter: sprinklr_rate_limiter.SlidingWindowRateLimiter,
 ) -> list[dict[str, object]]:
     """
     하나의 Widget에 대해 hasMore=False가 될 때까지 순차 호출한다.
@@ -1168,29 +1196,38 @@ def fetch_all_sprinklr_pages(
         page_payload = copy.deepcopy(payload)
         _set_value_at_path(page_payload, page_path, current_page)
 
-        print(
+        sprinklr_rate_limiter.safe_print(
             "[PAGINATION] "
             f"widget={widget_name} "
             f"sequence={sequence} "
             f"request_page={current_page} calling API..."
         )
 
-        response_json = fetch_sprinklr_data(
+        fetch_result = sprinklr_rate_limiter.fetch_sprinklr_data_with_retry(
             base_url=base_url,
             endpoint=endpoint,
             api_key=api_key,
             access_token=access_token,
             payload=page_payload,
+            rate_limiter=rate_limiter,
+            request_label=(
+                f"widget={widget_name} "
+                f"sequence={sequence} "
+                f"page={current_page}"
+            ),
         )
+        response_json = fetch_result.response_json
 
         response_data = response_json.get("data")
 
-        print(
+        sprinklr_rate_limiter.safe_print(
             "[RESPONSE STRUCTURE] "
+            f"widget={widget_name} "
             f"top_keys="
             f"{list(response_json.keys()) if isinstance(response_json, dict) else None} "
             f"data_keys="
-            f"{list(response_data.keys()) if isinstance(response_data, dict) else None}"
+            f"{list(response_data.keys()) if isinstance(response_data, dict) else None} "
+            f"attempts={fetch_result.attempt_count}"
         )
 
         has_more, has_more_path = extract_has_more(
@@ -1201,7 +1238,7 @@ def fetch_all_sprinklr_pages(
             response_json
         )
 
-        print(
+        sprinklr_rate_limiter.safe_print(
             "[PAGINATION] "
             f"widget={widget_name} "
             f"sequence={sequence} "
@@ -1228,7 +1265,7 @@ def fetch_all_sprinklr_pages(
                 for page_result in page_results
             )
 
-            print(
+            sprinklr_rate_limiter.safe_print(
                 "[PAGINATION COMPLETE] "
                 f"widget={widget_name} "
                 f"pages={len(page_results)} "
@@ -2596,6 +2633,91 @@ def save_response_sample(
     return file_path
 
 # =========================================================
+# 16.1. Widget 병렬 호출 작업 단위
+# =========================================================
+
+@dataclass(frozen=True)
+class WidgetFetchResult:
+    widget_name: str
+    page_results: list[dict[str, object]]
+    elapsed_seconds: float
+
+
+def process_widget_task(
+    widget_config: dict,
+    start_time_ms: int,
+    end_time_ms: int,
+) -> WidgetFetchResult:
+    """
+    Widget 하나의 payload 준비 + 전체 page fetch만 수행한다.
+
+    Excel 쓰기 / DataFrame 변환은 하지 않는다 — openpyxl Workbook이
+    thread-safe가 아니므로 그 부분은 항상 main()의 메인 스레드에서
+    WIDGET_CONFIGS 순서대로 처리한다.
+    """
+
+    widget_name = widget_config["widget_name"]
+    payload_path = widget_config["payload_path"]
+
+    sprinklr_rate_limiter.safe_print(
+        f"Processing widget: {widget_name}"
+    )
+    sprinklr_rate_limiter.safe_print(
+        f"Loading and Updating Sprinklr payload... widget={widget_name}"
+    )
+
+    payload = load_payload(payload_path)
+
+    payload = update_payload_time_range(
+        payload=payload,
+        start_time_ms=start_time_ms,
+        end_time_ms=end_time_ms,
+    )
+
+    save_payload(
+        payload=payload,
+        payload_path=payload_path,
+        make_backup=False,
+    )
+
+    sprinklr_rate_limiter.safe_print(
+        "Calling Sprinklr API with hasMore pagination... "
+        f"widget={widget_name}"
+    )
+
+    widget_call_start_perf = time.perf_counter()
+    log_widget_call_timer(
+        event="start",
+        widget_name=widget_name,
+    )
+
+    page_results = fetch_all_sprinklr_pages(
+        base_url=SPRINKLR_BASE_URL,
+        endpoint=ENDPOINT,
+        api_key=API_KEY,
+        access_token=ACCESS_TOKEN,
+        payload=payload,
+        widget_name=widget_name,
+        rate_limiter=RATE_LIMITER,
+    )
+
+    widget_call_elapsed_seconds = (
+        time.perf_counter() - widget_call_start_perf
+    )
+    log_widget_call_timer(
+        event="end",
+        widget_name=widget_name,
+        elapsed_seconds=widget_call_elapsed_seconds,
+    )
+
+    return WidgetFetchResult(
+        widget_name=widget_name,
+        page_results=page_results,
+        elapsed_seconds=widget_call_elapsed_seconds,
+    )
+
+
+# =========================================================
 # 17. 실행 함수
 # =========================================================
 
@@ -2669,153 +2791,201 @@ def main() -> None:
     # 두 시트를 먼저 만들고 1행 헤더를 작성한다.
     ensure_raw_data_sheets(workbook)
 
+    widget_call_timings: list[tuple[str, float]] = []
+    widgets_call_phase_start_perf = time.perf_counter()
+    log_widget_call_timer(event="phase_start")
+
     try:
-        # 3. 각 widget에 대한 payload load 및 update
-        for widget_config in WIDGET_CONFIGS:
-            widget_name = widget_config["widget_name"]
-            payload_path = widget_config["payload_path"]
+        # 3~4. Widget 12개를 동시에 제출해 fetch를 병렬로 진행한다.
+        # Excel 쓰기는 openpyxl이 thread-safe가 아니므로, fetch가
+        # 끝나는 순서와 무관하게 항상 WIDGET_CONFIGS 순서대로
+        # 메인 스레드에서만 소비/기록한다.
+        widget_executor = ThreadPoolExecutor(
+            max_workers=MAX_WIDGET_WORKERS,
+            thread_name_prefix="sprinklr-widget",
+        )
+        widget_futures: dict[str, "Future[WidgetFetchResult]"] = {}
 
-            print(f"Processing widget: {widget_name}")
+        try:
+            widget_futures = {
+                widget_config["widget_name"]: widget_executor.submit(
+                    process_widget_task,
+                    widget_config,
+                    start_time_ms,
+                    end_time_ms,
+                )
+                for widget_config in WIDGET_CONFIGS
+            }
 
-            print("Loading and Updating Sprinklr payload...")
-            payload = load_payload(payload_path)
-        
-    
-            payload = update_payload_time_range(
-                payload=payload, 
-                start_time_ms=start_time_ms, 
-                end_time_ms=end_time_ms
-            )
+            for widget_config in WIDGET_CONFIGS:
+                widget_name = widget_config["widget_name"]
 
-            save_payload(
-                payload=payload,
-                payload_path=payload_path,
-                make_backup=False
-            )
-        
-            # 4. 해당 Widget의 전체 page API 호출
-            # hasMore=False가 나올 때까지 순차적으로 수집한다.
-            print("Calling Sprinklr API with hasMore pagination...")
+                try:
+                    widget_result = widget_futures[widget_name].result()
+                except Exception:
+                    # 위젯 하나라도 실패하면 나머지 대기를 즉시
+                    # 중단한다 (기존 순차 버전의 "하나 실패 시
+                    # 전체 중단" 동작과 동일).
+                    sprinklr_rate_limiter.get_stop_event().set()
+                    for pending_future in widget_futures.values():
+                        pending_future.cancel()
+                    widget_executor.shutdown(
+                        wait=False,
+                        cancel_futures=True,
+                    )
+                    raise
 
-            page_results = fetch_all_sprinklr_pages(
-                base_url=SPRINKLR_BASE_URL,
-                endpoint=ENDPOINT,
-                api_key=API_KEY,
-                access_token=ACCESS_TOKEN,
-                payload=payload,
-                widget_name=widget_name,
-            )
-
-            # 5. 페이지별 raw response 저장 + DataFrame 변환
-            TARGET_SHEET_NAME = get_target_sheet_name(
-                widget_name
-            )
-
-            page_dataframes: list[pd.DataFrame] = []
-
-            for page_result in page_results:
-                page_sequence = int(
-                    page_result["sequence"]
+                widget_call_timings.append(
+                    (widget_name, widget_result.elapsed_seconds)
                 )
 
-                response_json = page_result[
-                    "response_json"
+                page_results = widget_result.page_results
+
+                # 5. 페이지별 raw response 저장 + DataFrame 변환
+                TARGET_SHEET_NAME = get_target_sheet_name(
+                    widget_name
+                )
+
+                page_dataframes: list[pd.DataFrame] = []
+
+                for page_result in page_results:
+                    page_sequence = int(
+                        page_result["sequence"]
+                    )
+
+                    response_json = page_result[
+                        "response_json"
+                    ]
+
+                    # raw JSON은 pagination 추적을 위해 페이지별 저장
+                    response_file_path = save_response_sample(
+                        response_json=response_json,
+                        widget_name=widget_name,
+                        output_dir=temporary_response_dir,
+                        page_sequence=page_sequence,
+                    )
+
+                    print(
+                        "[PAGINATION SAVED] "
+                        f"widget={widget_name} "
+                        f"sequence={page_sequence} "
+                        f"file={response_file_path.name}"
+                    )
+
+                    print(
+                        "Converting response page to DataFrame... "
+                        f"widget={widget_name}, "
+                        f"sequence={page_sequence}"
+                    )
+
+                    page_df = make_conversation_stream_dataframe(
+                        response_json=response_json,
+                        target_sheet_name=TARGET_SHEET_NAME,
+                    )
+
+                    page_dataframes.append(page_df)
+
+                if not page_dataframes:
+                    raise RuntimeError(
+                        "Sprinklr pagination 결과가 비어 있습니다.\n"
+                        f"Widget: {widget_name}"
+                    )
+
+                # 페이지별 JSON 파일은 그대로 보관하고,
+                # DataFrame 기준으로 하나의 Widget 데이터로 합친다.
+                df = pd.concat(
+                    page_dataframes,
+                    ignore_index=True,
+                    sort=False,
+                )
+
+                df = make_dataframe_excel_safe(df)
+
+                expected_raw_rows = sum(
+                    int(page_result["row_count"])
+                    for page_result in page_results
+                )
+
+                print(
+                    "[PAGINATION MERGED] "
+                    f"widget={widget_name} "
+                    f"pages={len(page_results)} "
+                    f"response_rows={expected_raw_rows} "
+                    f"dataframe_rows={len(df)}"
+                )
+
+                df["source_widget"] = widget_name
+                df["data_cut_start"] = data_cut_start
+                df["data_cut_end"] = data_cut_end
+                df["extracted_at"] = datetime.now(
+                    ZoneInfo("Asia/Seoul")
+                ).strftime("%Y-%m-%d %H:%M:%S")
+
+                # 기존 컬럼을 먼저 배치하고, 신규 Sender Profile 컬럼은
+                # 가장 뒤에 오도록 최종 순서를 통일한다.
+                final_columns = get_raw_data_sheet_columns(
+                    TARGET_SHEET_NAME
+                )
+
+                missing_columns = [
+                    column
+                    for column in final_columns
+                    if column not in df.columns
                 ]
 
-                # raw JSON은 pagination 추적을 위해 페이지별 저장
-                response_file_path = save_response_sample(
-                    response_json=response_json,
-                    widget_name=widget_name,
-                    output_dir=temporary_response_dir,
-                    page_sequence=page_sequence,
-                )
+                if missing_columns:
+                    raise ValueError(
+                        "Required Raw Data columns are missing.\n"
+                        f"Sheet: {TARGET_SHEET_NAME}\n"
+                        f"Missing columns: {missing_columns}\n"
+                        f"Actual columns: {list(df.columns)}"
+                    )
+
+                df = df[final_columns].copy()
 
                 print(
-                    "[PAGINATION SAVED] "
-                    f"widget={widget_name} "
-                    f"sequence={page_sequence} "
-                    f"file={response_file_path.name}"
+                    f"Writing data to Excel... "
+                    f"sheet={TARGET_SHEET_NAME}, rows={len(df)}"
                 )
-
-                print(
-                    "Converting response page to DataFrame... "
-                    f"widget={widget_name}, "
-                    f"sequence={page_sequence}"
+                append_dataframe_to_excel(
+                    workbook=workbook,
+                    df=df,
+                    sheet_name=TARGET_SHEET_NAME
                 )
-
-                page_df = make_conversation_stream_dataframe(
-                    response_json=response_json,
-                    target_sheet_name=TARGET_SHEET_NAME,
-                )
-
-                page_dataframes.append(page_df)
-
-            if not page_dataframes:
-                raise RuntimeError(
-                    "Sprinklr pagination 결과가 비어 있습니다.\n"
-                    f"Widget: {widget_name}"
-                )
-
-            # 페이지별 JSON 파일은 그대로 보관하고,
-            # DataFrame 기준으로 하나의 Widget 데이터로 합친다.
-            df = pd.concat(
-                page_dataframes,
-                ignore_index=True,
-                sort=False,
+        finally:
+            widget_executor.shutdown(
+                wait=True,
+                cancel_futures=False,
             )
+            sprinklr_rate_limiter.close_registered_sessions()
 
-            df = make_dataframe_excel_safe(df)
+        widgets_call_phase_elapsed_seconds = (
+            time.perf_counter() - widgets_call_phase_start_perf
+        )
+        log_widget_call_timer(
+            event="phase_end",
+            elapsed_seconds=widgets_call_phase_elapsed_seconds,
+        )
 
-            expected_raw_rows = sum(
-                int(page_result["row_count"])
-                for page_result in page_results
-            )
+        sum_widget_call_elapsed_seconds = sum(
+            elapsed_seconds
+            for _, elapsed_seconds in widget_call_timings
+        )
 
+        print(
+            "[WIDGET_CALL_TIMER] summary "
+            f"widget_count={len(widget_call_timings)} "
+            f"sum_widget_elapsed_sec="
+            f"{sum_widget_call_elapsed_seconds:.2f} "
+            f"phase_wall_elapsed_sec="
+            f"{widgets_call_phase_elapsed_seconds:.2f}"
+        )
+
+        for timed_widget_name, elapsed_seconds in widget_call_timings:
             print(
-                "[PAGINATION MERGED] "
-                f"widget={widget_name} "
-                f"pages={len(page_results)} "
-                f"response_rows={expected_raw_rows} "
-                f"dataframe_rows={len(df)}"
-            )
-
-            df["source_widget"] = widget_name
-            df["data_cut_start"] = data_cut_start
-            df["data_cut_end"] = data_cut_end
-            df["extracted_at"] = datetime.now(
-                ZoneInfo("Asia/Seoul")
-            ).strftime("%Y-%m-%d %H:%M:%S")
-
-            # 기존 컬럼을 먼저 배치하고, 신규 Sender Profile 컬럼은
-            # 가장 뒤에 오도록 최종 순서를 통일한다.
-            final_columns = get_raw_data_sheet_columns(
-                TARGET_SHEET_NAME
-            )
-
-            missing_columns = [
-                column
-                for column in final_columns
-                if column not in df.columns
-            ]
-
-            if missing_columns:
-                raise ValueError(
-                    "Required Raw Data columns are missing.\n"
-                    f"Sheet: {TARGET_SHEET_NAME}\n"
-                    f"Missing columns: {missing_columns}\n"
-                    f"Actual columns: {list(df.columns)}"
-                )
-
-            df = df[final_columns].copy()
-
-            print(
-                f"Writing data to Excel... "
-                f"sheet={TARGET_SHEET_NAME}, rows={len(df)}"
-            )
-            append_dataframe_to_excel(
-                workbook=workbook,
-                df=df,
-                sheet_name=TARGET_SHEET_NAME
+                "[WIDGET_CALL_TIMER] summary_detail "
+                f'widget="{timed_widget_name}" '
+                f"elapsed_sec={elapsed_seconds:.2f}"
             )
 
         # 모든 Widget 처리가 끝난 뒤 임시 Excel을 먼저 완성한다.
