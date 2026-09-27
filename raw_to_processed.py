@@ -650,6 +650,67 @@ def process_one_sheet(
         column_name="Query",
     )
 
+    # 본 처리 루프 전에 이 시트의 YT permalink만 먼저 훑어서
+    # ThreadPoolExecutor로 병렬 prefetch한다 (Sprinklr 위젯과 동일한
+    # 패턴). YT는 session/브라우저 상태를 공유하지 않는 순수 yt-dlp
+    # 호출이라 병렬화가 안전하지만, X/FB/TT는 Playwright persistent
+    # context를 공유해서 이 방식을 적용할 수 없다.
+    #
+    # 여기서는 채널만 보고 대상을 추리기 때문에, 이후 본 루프에서
+    # created_time/conversation_stream 누락 등으로 실제로는 건너뛰는
+    # 행의 URL도 일부 prefetch될 수 있다 (허용 가능한 낭비이며
+    # 정확성에는 영향이 없다).
+    youtube_permalinks_to_prefetch: list[str] = []
+
+    for prefetch_row_idx in range(
+        header_row + 1,
+        source_ws.max_row + 1,
+    ):
+        raw_sn_type_for_prefetch = source_ws.cell(
+            row=prefetch_row_idx,
+            column=sn_type_col_idx,
+        ).value
+
+        if raw_sn_type_for_prefetch is None:
+            continue
+
+        if (
+            mapping_channel(
+                raw_sn_type_for_prefetch
+            )
+            != "YT"
+        ):
+            continue
+
+        permalink_for_prefetch = source_ws.cell(
+            row=prefetch_row_idx,
+            column=permalink_col_idx,
+        ).value
+
+        if permalink_for_prefetch is None:
+            continue
+
+        youtube_permalinks_to_prefetch.append(
+            str(
+                permalink_for_prefetch
+            ).strip()
+        )
+
+    if youtube_permalinks_to_prefetch:
+        print(
+            "[INFO] YT 댓글 URL "
+            f"{len(youtube_permalinks_to_prefetch)}건 "
+            "병렬 prefetch 시작..."
+        )
+
+        comment_session.prefetch_youtube_comment_urls(
+            youtube_permalinks_to_prefetch
+        )
+
+        print(
+            "[INFO] YT 댓글 URL prefetch 완료"
+        )
+
     output_row = start_output_row
     written_count = 0
     skipped_duplicate_count = 0

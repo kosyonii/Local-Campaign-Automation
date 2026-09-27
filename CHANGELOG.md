@@ -7,6 +7,14 @@
 - 원인 진단: `260920_4차` step2(`raw_to_processed.py`) 실행이 두 차례(12:38, 14:11) 전부 yt-dlp `getaddrinfo failed (Errno 11001)`로 실패. Windows 이벤트 로그(Kernel-Power/Power-Troubleshooter) 대조 결과 두 실패 모두 노트북 절전모드 해제(전원 버튼) 후 1~3초 만에 실행되어, Wi-Fi가 아직 재연결(재인증+DHCP+DNS)되지 않은 상태에서 `www.youtube.com`/`www.instagram.com` resolve가 통째로 실패한 것으로 확인. DNS 서버(KT 168.126.63.1/.2)·호스트 파일·프록시·VPN 자체는 문제 없음을 별도 확인
 - `raw_to_processed.py`에 `wait_for_network_ready()` 추가: media/comment 추출 시작 직전 `www.youtube.com`/`www.instagram.com` DNS resolve를 2초 간격으로 재시도(최대 30초)하여 절전 해제 직후 재실행되어도 Wi-Fi 재연결을 기다린 뒤 진행하도록 함. 30초 내 resolve가 계속 실패하면 경고만 남기고 진행(원인 불명 DNS 장애까지 무한 대기하지 않기 위함)
 
+### YT 댓글 추출 병렬화 (ThreadPoolExecutor prefetch)
+
+- `260920_4차` step2 재검증 결과 채널별 소요시간 중 YT(92건, 2043.6초)·X(217건, 1531.4초)가 대부분을 차지하는 것을 확인. X/FB/TT는 로그인 세션 유지를 위해 Playwright persistent context(동기 API, 단일 스레드 전용, 프로필 디렉터리 단일 프로세스 락) 하나를 세션 전체에서 공유하고 있어 단순 스레드풀 병렬화가 불가능하고, 계정 잠김 리스크도 있어 별도 검토로 보류. YT/IG는 세션·브라우저 상태를 공유하지 않는 순수 yt-dlp 호출이라 Sprinklr 위젯과 동일한 패턴 적용 가능
+- `comment_extractor.py`: `CommentExtractorSession`에 YT 결과 prefetch 캐시(`_youtube_prefetch_cache` + lock) 추가. `prefetch_youtube_comment_urls()`로 시트의 YT permalink를 `ThreadPoolExecutor`(기본 6 workers)로 동시에 `extract_youtube_comment_url()` 호출해 캐시를 채우고, 기존 `extract_comment_url()`의 YT 분기는 `pop_cached_youtube_result()`로 캐시를 먼저 소비(캐시 미스 시 기존처럼 동기 호출로 자연스럽게 fallback, 중복 집계 없음)
+- `raw_to_processed.py`: `process_one_sheet()` 본 처리 루프 전에 해당 시트의 YT permalink를 먼저 훑어 `prefetch_youtube_comment_urls()`를 호출하도록 추가
+- 실측 검증: 실제 캠페인 데이터 중 가장 느렸던 YT 영상 5건(기존 순차 기록 합계 328.4초)을 병렬 prefetch로 재실행 → 81.0초(약 가장 느린 영상 1건 수준) = **4.05배 단축**, 5건 전부 정상 추출
+- 부수 조사: `max_comments`를 50→5로 줄이면 개별 호출이 빨라질 거라 가정하고 테스트했으나 실측상 유의미한 차이 없음(병목은 댓글 페이지 수가 아니라 yt-dlp가 영상당 거치는 기본 요청들의 네트워크 왕복)을 확인하고 50으로 원복. 효과 없이 "상위 댓글이 전부 작성자 고정 댓글인 영상에서 결과를 못 찾을 위험"만 키우는 변경이었음
+
 ## 2026-09-22
 
 ### 인증 정보 관리 개선
