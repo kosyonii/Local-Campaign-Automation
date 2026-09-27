@@ -1,8 +1,10 @@
 from pathlib import Path
 import json
 import datetime
+import os
 
 import pandas as pd
+from dotenv import load_dotenv
 from google.cloud import bigquery
 from google.oauth2 import service_account
 
@@ -11,8 +13,17 @@ from google.oauth2 import service_account
 # 1. 사용자 설정값
 # ============================================================
 
-# 서비스 계정 JSON key 경로
-KEY_PATH = r"C:\Users\KEARNEY\Desktop\gcp-key\slcc-buzz-agent-dev-449cfae180df.json"
+# 프로젝트 루트 .env를 읽는다. 이미 설정된 환경변수는 덮어쓰지 않는다.
+load_dotenv(
+    dotenv_path=Path(__file__).resolve().parent / ".env",
+    override=False,
+)
+
+# 서비스 계정 JSON key 경로 (.env의 GOOGLE_SERVICE_ACCOUNT_FILE)
+KEY_PATH = (
+    os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE")
+    or os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+)
 
 # BigQuery 정보
 PROJECT_ID = "slcc-buzz-agent-dev"
@@ -56,6 +67,11 @@ def write_log(status: str, message: str, extra: dict | None = None):
 # ============================================================
 
 def create_bigquery_client() -> bigquery.Client:
+    if not KEY_PATH:
+        raise RuntimeError(
+            "프로젝트 루트 .env에 GOOGLE_SERVICE_ACCOUNT_FILE을 설정해주세요."
+        )
+
     credentials = service_account.Credentials.from_service_account_file(
         KEY_PATH
     )

@@ -6,6 +6,7 @@ from google.cloud import storage
 import os
 
 import pandas as pd
+from dotenv import load_dotenv
 
 pd.set_option("display.max_columns", None)
 
@@ -13,8 +14,17 @@ INPUT_PATH = Path("input/raw_campaign.xlsx")
 OUTPUT_JSONL_PATH = Path("output/clean_campaign.jsonl")
 OUTPUT_CSV_PATH = Path("output/clean_campaign_preview.csv")
 
-GCS_KEY_PATH = r"C:\Users\KEARNEY\Desktop\gcp-key\slcc-buzz-agent-dev-449cfae180df.json"
-os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = GCS_KEY_PATH
+"""프로젝트 루트 .env에서 서비스 계정 key 경로를 읽는다"""
+load_dotenv(
+    dotenv_path=Path(__file__).resolve().parent / ".env",
+    override=False,
+)
+GCS_KEY_PATH = (
+    os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE")
+    or os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+)
+if GCS_KEY_PATH:
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = GCS_KEY_PATH
 
 BUCKET_NAME = "slcc-local-campaign-images"
 GCS_FOLDER = "campaign_images"
