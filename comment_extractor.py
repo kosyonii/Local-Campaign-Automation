@@ -29,6 +29,7 @@ build_url_cell_value(channel, post_url) -> str | None
 
 import atexit
 import base64
+import csv
 import html
 import logging
 import re
@@ -676,6 +677,10 @@ class CommentExtractorSession:
         self._comment_errors = 0
         self._summary_printed = False
 
+        # before/after 소요시간 비교용 호출별 raw 기록.
+        # (채널, URL, 성공 여부, 오류 여부, 소요시간)을 호출마다 남긴다.
+        self._call_records: list[dict[str, Any]] = []
+
         self._closed = False
 
     def record_comment_result(
@@ -683,8 +688,16 @@ class CommentExtractorSession:
         *,
         extracted: bool,
         error: bool = False,
+        channel: str | None = None,
+        url: str | None = None,
+        duration_seconds: float | None = None,
     ) -> None:
-        """댓글 추출 1건의 결과를 summary 통계에 기록한다."""
+        """
+        댓글 추출 1건의 결과를 summary 통계 및 raw 기록에 남긴다.
+
+        channel / url / duration_seconds는 계측(before-after 비교) 목적으로
+        추가된 선택 인자이며, 기존 호출부(값을 안 넘기는 경우)와 호환된다.
+        """
 
         with self._stats_lock:
             self._comment_attempts += 1
@@ -697,10 +710,108 @@ class CommentExtractorSession:
             if error:
                 self._comment_errors += 1
 
+            self._call_records.append(
+                {
+                    "channel": channel,
+                    "url": url,
+                    "extracted": extracted,
+                    "error": error,
+                    "duration_seconds": duration_seconds,
+                }
+            )
+
+    def get_channel_stats(
+        self,
+    ) -> dict[str, dict[str, float | int]]:
+        """
+        채널별 호출 건수 / 성공 건수 / 소요시간(합계·평균·최댓값)을 집계한다.
+
+        duration_seconds가 기록되지 않은 호출(과거 호출부 등)은
+        시간 집계에서만 제외하고 건수 집계에는 포함한다.
+        """
+
+        with self._stats_lock:
+            records = list(self._call_records)
+
+        stats: dict[str, dict[str, float | int]] = {}
+
+        for record in records:
+            channel = record.get("channel") or "UNKNOWN"
+            bucket = stats.setdefault(
+                channel,
+                {
+                    "attempts": 0,
+                    "extracted": 0,
+                    "errors": 0,
+                    "timed_count": 0,
+                    "total_duration": 0.0,
+                    "max_duration": 0.0,
+                },
+            )
+
+            bucket["attempts"] += 1
+
+            if record.get("extracted"):
+                bucket["extracted"] += 1
+
+            if record.get("error"):
+                bucket["errors"] += 1
+
+            duration = record.get("duration_seconds")
+
+            if duration is not None:
+                bucket["timed_count"] += 1
+                bucket["total_duration"] += duration
+                bucket["max_duration"] = max(
+                    bucket["max_duration"],
+                    duration,
+                )
+
+        return stats
+
+    def export_call_records_csv(
+        self,
+        path: Path,
+    ) -> None:
+        """
+        채널/URL별 개별 호출 기록을 CSV로 저장한다.
+
+        case1/case2 before-after 비교 시 어느 채널·게시물이
+        전체 소요시간을 주도했는지 분석하는 용도.
+        """
+
+        with self._stats_lock:
+            records = list(self._call_records)
+
+        path.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        with path.open(
+            "w",
+            newline="",
+            encoding="utf-8-sig",
+        ) as csv_file:
+            writer = csv.DictWriter(
+                csv_file,
+                fieldnames=[
+                    "channel",
+                    "url",
+                    "extracted",
+                    "error",
+                    "duration_seconds",
+                ],
+            )
+            writer.writeheader()
+
+            for record in records:
+                writer.writerow(record)
+
     def print_comment_summary(
         self,
     ) -> None:
-        """세션 전체 댓글 추출 결과를 한 줄로 출력한다."""
+        """세션 전체 댓글 추출 결과를 요약 출력한다 (전체 + 채널별)."""
 
         if (
             not COMMENT_SUMMARY_ENABLED
@@ -729,6 +840,25 @@ class CommentExtractorSession:
                 else ""
             )
         )
+
+        channel_stats = self.get_channel_stats()
+
+        for channel, bucket in sorted(channel_stats.items()):
+            timed_count = bucket["timed_count"]
+            avg_duration = (
+                bucket["total_duration"] / timed_count
+                if timed_count
+                else 0.0
+            )
+
+            print(
+                f"  - {channel}: "
+                f"{bucket['attempts']}건 | "
+                f"추출 {bucket['extracted']}건 | "
+                f"평균 {avg_duration:.1f}초 | "
+                f"최대 {bucket['max_duration']:.1f}초 | "
+                f"합계 {bucket['total_duration']:.1f}초"
+            )
 
     def __enter__(
         self,
@@ -3362,6 +3492,8 @@ def extract_comment_url(
         or get_default_comment_extractor_session()
     )
 
+    call_started_at = time.monotonic()
+
     try:
         if normalized_channel == "YT":
             comment_url = (
@@ -3416,6 +3548,12 @@ def extract_comment_url(
                 is not None
             ),
             error=False,
+            channel=normalized_channel,
+            url=normalized_post_url,
+            duration_seconds=(
+                time.monotonic()
+                - call_started_at
+            ),
         )
 
         return normalized_comment_url
@@ -3424,6 +3562,12 @@ def extract_comment_url(
         stats_session.record_comment_result(
             extracted=False,
             error=True,
+            channel=normalized_channel,
+            url=normalized_post_url,
+            duration_seconds=(
+                time.monotonic()
+                - call_started_at
+            ),
         )
 
         message = (

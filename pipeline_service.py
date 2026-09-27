@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import csv
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 import json
 import os
 from pathlib import Path
 import subprocess
 import sys
+import time
 from typing import Callable, Literal
 
 from pipeline_run_paths import (
@@ -497,6 +499,10 @@ def run_module(
             log_callback=log_callback,
         )
 
+    # before/after 소요시간 비교를 위한 모듈 단위 타이밍 측정.
+    module_started_at_monotonic = time.monotonic()
+    module_started_at_utc = datetime.now(timezone.utc)
+
     process = subprocess.Popen(
         command,
         stdin=subprocess.PIPE,
@@ -527,6 +533,28 @@ def run_module(
 
     return_code = process.wait()
 
+    module_finished_at_utc = datetime.now(timezone.utc)
+    module_elapsed_seconds = (
+        time.monotonic()
+        - module_started_at_monotonic
+    )
+
+    _record_module_timing(
+        module_name=module_name,
+        run_paths=run_paths,
+        started_at_utc=module_started_at_utc,
+        finished_at_utc=module_finished_at_utc,
+        elapsed_seconds=module_elapsed_seconds,
+        return_code=return_code,
+    )
+
+    _emit_log(
+        f"⏱️ 소요시간: {module_name} = "
+        f"{module_elapsed_seconds:.1f}초 "
+        f"({module_elapsed_seconds / 60:.1f}분)",
+        log_callback=log_callback,
+    )
+
     if return_code != 0:
         raise RuntimeError(
             f"{module_name} 실행 실패 "
@@ -540,6 +568,81 @@ def run_module(
         f"✅ 실행 완료: {module_name}",
         log_callback=log_callback,
     )
+
+
+def _record_module_timing(
+    *,
+    module_name: str,
+    run_paths: PipelineRunPaths,
+    started_at_utc: datetime,
+    finished_at_utc: datetime,
+    elapsed_seconds: float,
+    return_code: int,
+) -> None:
+    """
+    모듈(1~4단계)별 소요시간을 같은 실행 차수 output 폴더의
+    module_timings.csv에 한 줄씩 append한다.
+
+    case1/case2처럼 여러 기간을 반복 실행하며 before/after를
+    비교할 때, 실행 차수 폴더별로 총 소요시간을 바로 비교하기 위한
+    용도이다. 이 로깅이 실패해도 파이프라인 실행 자체는
+    막지 않는다.
+    """
+
+    timing_csv_path = (
+        run_paths.output_dir / "module_timings.csv"
+    )
+
+    is_new_file = not timing_csv_path.exists()
+
+    try:
+        timing_csv_path.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        with timing_csv_path.open(
+            "a",
+            newline="",
+            encoding="utf-8-sig",
+        ) as csv_file:
+            writer = csv.DictWriter(
+                csv_file,
+                fieldnames=[
+                    "module_name",
+                    "run_label",
+                    "started_at_utc",
+                    "finished_at_utc",
+                    "elapsed_seconds",
+                    "return_code",
+                ],
+            )
+
+            if is_new_file:
+                writer.writeheader()
+
+            writer.writerow(
+                {
+                    "module_name": module_name,
+                    "run_label": run_paths.run_label,
+                    "started_at_utc": (
+                        started_at_utc.isoformat()
+                    ),
+                    "finished_at_utc": (
+                        finished_at_utc.isoformat()
+                    ),
+                    "elapsed_seconds": (
+                        f"{elapsed_seconds:.3f}"
+                    ),
+                    "return_code": return_code,
+                }
+            )
+
+    except Exception as exc:
+        print(
+            "[WARNING] module_timings.csv 기록 실패: "
+            f"{type(exc).__name__}: {exc}"
+        )
 
 
 def run_local_campaign_pipeline(
