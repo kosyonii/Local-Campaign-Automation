@@ -2,6 +2,7 @@
 .env
 .env.*
 !.env.example
+.instagram_cookies.txt
 
 # Browser profiles / local session data
 .fb_browser_profile/
