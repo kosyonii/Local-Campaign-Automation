@@ -1,5 +1,16 @@
 # 수정 로그
 
+## 2026-09-28
+
+### [보류] Instagram 미디어 추출 로그인 벽 — 누락건 4건 미해결
+
+- `누락/output_누락/260922_누락` 결과 확인: IG 게시물 5건 중 1건만 성공(row5, Sprinklr가 크롤링 시점에 잡아둔 직접 미디어 URL이 아직 살아있었음), 나머지 4건은 `manual_action_required`로 LLM 분석 스킵됨(HTTP 403 / gallery-dl 실패 / 미디어 판별 불가)
+- 원인: 직접 URL이 만료되면 gallery-dl로 게시물 페이지를 직접 여는 대체 경로를 타는데, Instagram이 익명 접근을 로그인 페이지로 리다이렉트함 (실측: 4건 전부 재현)
+- 1차 해결 시도: 기존 Twitter/X와 동일한 `--cookies-from-browser edge` 방식(Edge에 로그인된 쿠키를 gallery-dl이 직접 읽음)을 Instagram에도 적용 시도 → Edge/Chrome의 Application-Bound Encryption 때문에 gallery-dl/yt-dlp가 쿠키 DB를 복호화하지 못하는 것으로 확인 (yt-dlp도 동일 증상, 알려진 이슈: https://github.com/yt-dlp/yt-dlp/issues/10927). Twitter도 로그인 필요한 게시물이면 같은 문제를 겪을 가능성 있음
+- 2차 해결 시도: Windows 정책으로 Application-Bound Encryption을 끄는 방법은 보안 약화에 해당해 Claude Code 자동 승인이 차단 + 관리자 권한도 없어 보류
+- `media_extractor.py`에 `is_instagram_url()`, `INSTAGRAM_USE_COOKIES_FILE`/`INSTAGRAM_COOKIES_FILE_PATH` 설정을 미리 추가해둠: 브라우저 확장으로 내보낸 Netscape 형식 `.instagram_cookies.txt`가 프로젝트 루트에 있으면 gallery-dl `--cookies` 옵션으로 자동 사용, 없으면 기존과 동일하게 조용히 무시(부작용 없음). `.gitignore`에도 추가
+- **현재 상태: 보류.** 지금은 영향받는 게시물이 4건뿐이라 급하지 않다고 판단해 나중으로 미룸. `.instagram_cookies.txt` 파일만 채워 넣으면 바로 동작하는 상태로 남겨둠
+
 ## 2026-09-27
 
 ### 절전모드 해제 직후 DNS 실패로 인한 미디어 추출 전체 실패 수정

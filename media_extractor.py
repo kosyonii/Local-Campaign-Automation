@@ -64,6 +64,14 @@ TWITTER_INCLUDE_CARD_IMAGES = False
 TIKTOK_USE_BROWSER_COOKIES = False
 TIKTOK_BROWSER = "edge"
 
+# Instagram은 --cookies-from-browser를 쓰지 않는다. 최신 Edge/Chrome의
+# Application-Bound Encryption 때문에 gallery-dl/yt-dlp가 브라우저
+# 쿠키 DB를 복호화하지 못한다 (https://github.com/yt-dlp/yt-dlp/issues/10927).
+# 대신 브라우저 확장 프로그램으로 내보낸 Netscape 형식 cookies.txt
+# 파일을 사용한다. 파일이 없으면 쿠키 없이(기존 동작) 시도한다.
+INSTAGRAM_USE_COOKIES_FILE = True
+INSTAGRAM_COOKIES_FILE_PATH = BASE_DIR / ".instagram_cookies.txt"
+
 # TikTok 게시물은 gallery-dl 대신 yt-dlp로 직접 다운로드한다.
 # 로컬 테스트에서 성공한 Chrome impersonation을 우선 사용하며,
 # 현재 환경에서 impersonation을 사용할 수 없으면 자동으로 일반 요청을 재시도한다.
@@ -1663,6 +1671,32 @@ def is_tiktok_post_url(
     )
 
 
+def is_instagram_url(
+    source_url: str | None,
+) -> bool:
+    """Instagram 게시물(post/reel/reels/tv) URL인지 확인한다."""
+
+    if not is_http_url(source_url):
+        return False
+
+    parsed_url = urlparse(source_url.strip())
+    hostname = (parsed_url.hostname or "").lower()
+
+    if hostname not in {
+        "instagram.com",
+        "www.instagram.com",
+    }:
+        return False
+
+    return bool(
+        re.search(
+            r"/(?:p|reel|reels|tv)/[^/?#]+",
+            parsed_url.path,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
 def twitter_media_identity_key(media_url: str) -> str:
     """X가 같은 미디어를 여러 해상도 URL로 반환할 때 동일 자산을 식별한다.
 
@@ -1796,6 +1830,18 @@ def extract_media_urls_with_gallery_dl(
                 [
                     "--cookies-from-browser",
                     TIKTOK_BROWSER,
+                ]
+            )
+
+    elif is_instagram_url(page_url):
+        if (
+            INSTAGRAM_USE_COOKIES_FILE
+            and INSTAGRAM_COOKIES_FILE_PATH.is_file()
+        ):
+            command.extend(
+                [
+                    "--cookies",
+                    str(INSTAGRAM_COOKIES_FILE_PATH),
                 ]
             )
 
