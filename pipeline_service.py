@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import threading
 import time
 from typing import Callable, Literal
 
@@ -509,6 +510,8 @@ def run_module(
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         bufsize=1,
         cwd=PROJECT_ROOT,
         env=module_environment,
@@ -570,6 +573,12 @@ def run_module(
     )
 
 
+# (5) 2b/3단계를 동시 실행할 때 두 스레드가 같은 run의
+# module_timings.csv에 거의 동시에 append할 수 있어 추가한 lock.
+# 순차 실행(기존 모든 호출부)에서는 아무 영향이 없다.
+_MODULE_TIMING_CSV_LOCK = threading.Lock()
+
+
 def _record_module_timing(
     *,
     module_name: str,
@@ -593,50 +602,51 @@ def _record_module_timing(
         run_paths.output_dir / "module_timings.csv"
     )
 
-    is_new_file = not timing_csv_path.exists()
-
     try:
         timing_csv_path.parent.mkdir(
             parents=True,
             exist_ok=True,
         )
 
-        with timing_csv_path.open(
-            "a",
-            newline="",
-            encoding="utf-8-sig",
-        ) as csv_file:
-            writer = csv.DictWriter(
-                csv_file,
-                fieldnames=[
-                    "module_name",
-                    "run_label",
-                    "started_at_utc",
-                    "finished_at_utc",
-                    "elapsed_seconds",
-                    "return_code",
-                ],
-            )
+        with _MODULE_TIMING_CSV_LOCK:
+            is_new_file = not timing_csv_path.exists()
 
-            if is_new_file:
-                writer.writeheader()
+            with timing_csv_path.open(
+                "a",
+                newline="",
+                encoding="utf-8-sig",
+            ) as csv_file:
+                writer = csv.DictWriter(
+                    csv_file,
+                    fieldnames=[
+                        "module_name",
+                        "run_label",
+                        "started_at_utc",
+                        "finished_at_utc",
+                        "elapsed_seconds",
+                        "return_code",
+                    ],
+                )
 
-            writer.writerow(
-                {
-                    "module_name": module_name,
-                    "run_label": run_paths.run_label,
-                    "started_at_utc": (
-                        started_at_utc.isoformat()
-                    ),
-                    "finished_at_utc": (
-                        finished_at_utc.isoformat()
-                    ),
-                    "elapsed_seconds": (
-                        f"{elapsed_seconds:.3f}"
-                    ),
-                    "return_code": return_code,
-                }
-            )
+                if is_new_file:
+                    writer.writeheader()
+
+                writer.writerow(
+                    {
+                        "module_name": module_name,
+                        "run_label": run_paths.run_label,
+                        "started_at_utc": (
+                            started_at_utc.isoformat()
+                        ),
+                        "finished_at_utc": (
+                            finished_at_utc.isoformat()
+                        ),
+                        "elapsed_seconds": (
+                            f"{elapsed_seconds:.3f}"
+                        ),
+                        "return_code": return_code,
+                    }
+                )
 
     except Exception as exc:
         print(
@@ -1300,6 +1310,99 @@ def run_single_module(
             normalized_end_datetime
         ),
     )
+
+
+def run_2b_and_3_concurrently(
+    input_date: str,
+    run_number: int,
+    *,
+    consumer_reaction_module: str = "consumer_reaction_url.py",
+    media_extractor_module: str = "media_extractor_v2.py",
+    overwrite_existing: bool = False,
+    log_callback: LogCallback | None = None,
+) -> None:
+    """
+    (5) 2b(소비자 반응 URL 추출)와 3단계(media_extractor)를 동시에 실행한다.
+
+    media_extractor는 2a/2b의 formatted.xlsx가 아니라 1단계 raw 엑셀을
+    직접 읽으므로(build_excel_paths 참고) 2b와 3단계는 서로 다른 파일을
+    읽고 쓰는 완전히 독립된 브랜치다. 따라서 순차 실행 대신 스레드
+    2개로 동시에 실행해 wall time을 (2b elapsed + 3단계 elapsed)가
+    아니라 max(2b elapsed, 3단계 elapsed)로 줄일 수 있다.
+
+    기존 run_module()/run_single_module()은 그대로 두고, 이 함수는
+    run_module()을 두 스레드에서 호출만 한다 (module_timings.csv
+    동시 기록은 _MODULE_TIMING_CSV_LOCK으로 보호됨).
+
+    media_extractor_module 기본값은 아직 검증 중인 media_extractor_v2.py다.
+    검증 후 원본 media_extractor.py로 교체(swap-in)할 예정이며, 그 전까지는
+    이 함수를 실제 운영 파이프라인에 연결하지 않는다.
+    """
+
+    normalized_date = validate_input_date(
+        input_date
+    )
+
+    run_paths = resolve_existing_run_paths(
+        input_date=normalized_date,
+        run_number=run_number,
+    )
+
+    module_inputs = [normalized_date]
+
+    def _build_arguments(
+        module_name: str,
+    ) -> list[str]:
+        if not overwrite_existing:
+            return []
+
+        overwrite_argument = MODULE_OVERWRITE_ARGUMENTS.get(
+            module_name,
+            "--overwrite",
+        )
+
+        return [overwrite_argument]
+
+    errors: list[BaseException] = []
+    errors_lock = threading.Lock()
+
+    def _run(module_name: str) -> None:
+        try:
+            run_module(
+                module_name=module_name,
+                module_inputs=module_inputs,
+                run_paths=run_paths,
+                module_arguments=_build_arguments(
+                    module_name
+                ),
+                log_callback=log_callback,
+            )
+        except BaseException as exc:
+            with errors_lock:
+                errors.append(exc)
+
+    threads = [
+        threading.Thread(
+            target=_run,
+            args=(consumer_reaction_module,),
+        ),
+        threading.Thread(
+            target=_run,
+            args=(media_extractor_module,),
+        ),
+    ]
+
+    for thread in threads:
+        thread.start()
+
+    for thread in threads:
+        thread.join()
+
+    if errors:
+        # 둘 다 실패했더라도 첫 번째 오류만 올려서 기존
+        # run_module() 실패 시 동작(즉시 예외 발생)과 형태를 맞춘다.
+        raise errors[0]
+
 
 # =============================================================================
 # Buzz Volume Service

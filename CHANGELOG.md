@@ -2,6 +2,37 @@
 
 ## 2026-09-28
 
+### 최적화 2라운드 착수: (2) 2a/2b 분리, (3) YT/IG 병렬화 일반화, (5) 3단계·2b/3단계 병렬화 (복제 파일 기반, 아직 실제 파이프라인에 갈아끼우지 않음)
+
+- case1/case2 BEFORE-AFTER 비교 방법론을 지키기 위해, case2 BEFORE 측정이 끝나지 않은 상태에서 원본 파일(`raw_to_processed.py`, `comment_extractor.py`, `media_extractor.py`)은 건드리지 않고 전부 복제본에서 작업. case1 때처럼 완전한 "before" 기준선을 훼손하지 않기 위함
+- `raw_to_processed_2a.py` (신규, `raw_to_processed.py` 복제 후 수정): 댓글/reaction URL 추출 관련 코드(`CommentExtractorSession`, `wait_for_network_ready`, `build_url_cell_value` 호출) 전부 제거. Excel 정제만 수행하고 URL 컬럼에는 Permalink만 기록 (원래 의도했던 "URL=Permalink 단일값" 형태로 복귀)
+- `consumer_reaction_url.py` (신규 2b 모듈): 2a가 만든 `*_formatted.xlsx`를 읽어 채널별 소비자 댓글/reaction URL을 추출하고, 같은 URL 컬럼을 `POST_URL\nCOMMENT_URL` 형식으로 덮어씀 (llm_analysis_pipeline.py의 `split_post_and_comment_urls()` 계약 그대로 유지)
+- `comment_extractor_v2.py` (신규, HEAD의 `comment_extractor.py` 복제): 기존 YT 전용 prefetch 캐시(`_youtube_prefetch_cache`, `prefetch_youtube_comment_urls`)를 채널 범용으로 일반화 — `_PREFETCHABLE_EXTRACTORS` 레지스트리(YT/IG), `prefetch_comment_urls(channel, urls, max_workers)`, `pop_cached_result(channel, url)`. 채널별 평균 소요시간 차이(YT 평균 22s대 vs IG 평균 2s대)에 맞춰 동시성 차등 적용: `YOUTUBE_PREFETCH_MAX_WORKERS=6`, `INSTAGRAM_PREFETCH_MAX_WORKERS=12`. 기존 `prefetch_youtube_comment_urls()`/`pop_cached_youtube_result()`는 하위 호환용 얇은 래퍼로 유지
+- `consumer_reaction_url.py`에 위 일반화된 prefetch를 연결: 시트 내 YT/IG permalink를 채널별로 먼저 훑어 각각 병렬 prefetch
+- `media_extractor_v2.py` (신규, HEAD의 `media_extractor.py` 복제): `process_media_assets()`의 순차 `for asset in media_assets` 루프(URL feasibility 검사 + 실제 다운로드)를 `ThreadPoolExecutor(max_workers=8)` 기반 병렬 처리로 변경. asset마다 독립적인 HTTP 호출/파일 쓰기라 경합 없음. YouTube(다운로드 없음)/이미 처리된 asset은 기존처럼 순차 처리 후 병렬 대상만 추림
+- `pipeline_service.py`: 신규 함수 `run_2b_and_3_concurrently()` 추가 — 2b(`consumer_reaction_url.py`)와 3단계(`media_extractor`)가 1단계 raw 엑셀만 공통으로 필요로 하는 독립 브랜치임을 이용해(`media_extractor.py`는 2a/2b의 formatted.xlsx가 아니라 raw 엑셀을 직접 읽음, `build_excel_paths()` 확인) 두 모듈을 스레드 2개로 동시 실행. 기존 `run_module()`/`run_single_module()`/`PIPELINE_MODULES`는 전혀 수정하지 않음. `module_timings.csv` 동시 기록 경합 방지용 `_MODULE_TIMING_CSV_LOCK` 추가(순차 호출에는 영향 없음)
+- **현재 상태**: 위 신규/복제 파일들은 case2 BEFORE 측정(2,3,4단계)이 끝난 뒤 실제 파이프라인(`PIPELINE_MODULES`, 의존성 검증 등)에 갈아끼우고 case1+case2로 AFTER 재측정 예정. (4) X/FB/TT async 전환 여부는 그 실측 결과를 보고 결정 (코드 변경 없음, 보류)
+
+### case2 BEFORE 측정 방법론 오염 발견 및 재측정
+
+- case2(2026-09-07~09-13, 4배 데이터) BEFORE 베이스라인을 처음 실행했을 때 `raw_to_processed.py`/`comment_extractor.py`가 지난 세션에 이미 커밋된 YT 병렬화(`4112da3`)를 포함한 상태로 돌고 있음을 발견 — YT 병렬화 효과가 섞여 들어가 순수 "before" 기준선이 아니게 됨
+- 커밋 `559303b`(DNS 수정은 포함, YT 병렬화는 미포함) 시점으로 `raw_to_processed.py`/`comment_extractor.py`를 임시로 되돌려 case2를 처음부터 재실행. case1의 원래 BEFORE 측정과 동일한 조건으로 맞춤
+- 재실행 도중 시스템 메모리 부족으로 백그라운드 프로세스가 강제 종료되는 일이 발생(Claude Code 자체 보호 로직에 의한 종료, 코드 문제 아님) → 이를 계기로 중간 저장(체크포인트) 기능 추가(아래)
+- 두 파일은 case2 BEFORE(2,3,4단계) 측정이 모두 끝난 뒤 HEAD 상태로 원복 예정
+
+### 중간 저장(체크포인트) 기능 추가 — 메모리 부족 등 외부 강제종료 대비
+
+- `raw_to_processed.py`(현재 임시로 case1 이전 상태로 되돌려진 버전)와 `consumer_reaction_url.py`(신규 2b 모듈)에 동일한 패턴으로 추가
+- 3분마다(`CHECKPOINT_INTERVAL_SECONDS=180`) 워크북 + 진행 상태(JSON: 다음 처리할 행, 완료된 시트, output row 카운터, seen_urls/processed_count 등)를 임시 파일에 저장 후 `os.replace`로 원자적 교체 — 저장 도중 프로세스가 죽어도 기존 체크포인트 파일은 손상되지 않음
+- 재실행 시 체크포인트가 있으면 자동으로 그 지점부터 이어서 처리(시트/행 단위로 정확히 재개), 없으면 처음부터 시작
+- 정상 완료 시 체크포인트 파일 자동 삭제
+- 격리 환경에서 저장→재개→정리 라운드트립 단위 테스트로 검증 완료
+
+### pipeline_service.py 인코딩 버그 수정
+
+- `run_module()`의 `subprocess.Popen(..., text=True, ...)`가 명시적 encoding 없이 시스템 로캘(cp949)로 자식 프로세스 stdout을 디코딩하다가, 한글/이모지가 포함된 UTF-8 출력에서 `UnicodeDecodeError` 발생
+- `encoding="utf-8", errors="replace"`를 명시적으로 추가. 이번 세션 전에는 `pipeline_service.py`의 Python API(`run_single_module`/`run_local_campaign_pipeline`)가 실제로 호출된 적이 없어 잠재해 있던 버그였음
+
 ### [보류] Instagram 미디어 추출 로그인 벽 — 누락건 4건 미해결
 
 - `누락/output_누락/260922_누락` 결과 확인: IG 게시물 5건 중 1건만 성공(row5, Sprinklr가 크롤링 시점에 잡아둔 직접 미디어 URL이 아직 살아있었음), 나머지 4건은 `manual_action_required`로 LLM 분석 스킵됨(HTTP 403 / gallery-dl 실패 / 미디어 판별 불가)
