@@ -3,6 +3,13 @@
 
 ## 2026-09-28
 
+### BEFORE 파일 복원 + 체크포인트 기능 유지 및 2a 이식
+
+- `raw_to_processed.py`/`comment_extractor.py`를 BEFORE 측정용 559303b 상태에서 HEAD로 복원(YT 병렬 prefetch 복귀). 복원 전에 측정에 쓴 버전을 `Back-up/raw_to_processed_case2_BEFORE_with_checkpoint.py`, `Back-up/comment_extractor_case2_BEFORE_559303b.py`로 보관
+- 체크포인트 기능(3분 간격 워크북+진행 상태 원자적 저장, 재실행 시 이어서 처리, 정상 완료 시 정리)은 커밋 안 된 상태로 원본 `raw_to_processed.py`에만 있었음 → 유지: HEAD 복원본에 패치를 그대로 재적용(충돌 없음)하고, `raw_to_processed_2a.py`에도 같은 기능을 이식
+- 2a 검증(격리 폴더, case2 raw 엑셀 사본): 중단 없이 실행한 결과와, 도중 강제 종료(`os._exit`) 후 재실행해 체크포인트에서 이어서 완료한 결과가 889행 모두 동일, 완료 후 체크포인트 파일 정리 확인. 2a는 댓글 추출이 없어 전체 실행이 약 2.4초. 원본 `raw_to_processed.py`(HEAD+체크포인트)는 컴파일 확인만 했고 실행 검증은 하지 않음
+- **발견한 문제(미수정)**: `consumer_reaction_url.py`는 `raw_to_processed`에서 `wait_for_network_ready`를 import하지만 `raw_to_processed_2a.py`에는 이 함수가 없음. 2a를 `raw_to_processed.py` 자리에 갈아끼우면 2b가 ImportError로 실행되지 않음 → 갈아끼우기 전에 2a로 함수를 옮기거나 import 경로를 바꿔야 함. 앞서 리뷰에서 "필요한 이름이 모두 있다"고 한 것은 잘못이었음
+
 ### case2 BEFORE(1~4단계) 측정 완료 — 총 소요시간 요약
 
 - case2(2026-09-07~09-13, 4배 데이터) BEFORE 기준선(원본 코드: `raw_to_processed.py`/`comment_extractor.py`는 559303b 상태, `media_extractor.py`/`llm_analysis_pipeline.py`는 원본)
