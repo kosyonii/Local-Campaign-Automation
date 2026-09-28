@@ -7,6 +7,8 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
@@ -30,6 +32,13 @@ ENV_INPUT_DATE = "LOCAL_CAMPAIGN_INPUT_DATE"
 ENV_RUN_NUMBER = "LOCAL_CAMPAIGN_RUN_NUMBER"
 ENV_OUTPUT_DIR = "LOCAL_CAMPAIGN_OUTPUT_DIR"
 ENV_MEDIA_DIR = "LOCAL_CAMPAIGN_MEDIA_DIR"
+
+# check_media_url()/download_media_asset()는 asset마다 독립적인 HTTP
+# 호출(HEAD/GET)이고, requests.Session은 connection pool이 thread-safe해서
+# (요청 도중 session.headers 등 공유 상태를 변경하지 않는 한) 여러 스레드가
+# 하나의 Session을 안전하게 공유할 수 있다. 파일 다운로드도 asset마다
+# 고유한 경로에 쓰므로 경합이 없다.
+MEDIA_DOWNLOAD_MAX_WORKERS = 8
 
 RAW_SHEET_NAMES = ["Raw Data_원문", "Raw Data_전략법인"]
 LLM_INPUT_SHEET_NAME = "llm_input"
@@ -2966,16 +2975,12 @@ def process_media_assets(
     llm_url_ready 상태로 준비한다.
     """
 
-    processed_assets: list[MediaAsset] = []
+    processed_assets: list[MediaAsset | None] = [
+        None
+        for _ in media_assets
+    ]
 
-    # 실제 처리가 필요한 pending asset 개수만 계산
-    pending_asset_count = sum(
-        1
-        for asset in media_assets
-        if asset.status == "pending"
-    )
-
-    pending_index = 0
+    pending_indexes: list[int] = []
 
     with requests.Session() as session:
         session.headers.update(
@@ -2985,25 +2990,16 @@ def process_media_assets(
             }
         )
 
-        for asset in media_assets:
-            # =====================================================
-            # 이미 처리된 asset은 출력도 하지 않고 그대로 유지
-            # =====================================================
+        # =====================================================
+        # 1차 패스 (순차, 네트워크 없음): 이미 처리된 asset과
+        # YouTube(파일 다운로드 없이 URL만 사용)는 바로 확정하고,
+        # 실제 HTTP 검사/다운로드가 필요한 asset만 추려둔다.
+        # =====================================================
+        for index, asset in enumerate(media_assets):
             if asset.status != "pending":
-                processed_assets.append(asset)
+                processed_assets[index] = asset
                 continue
 
-            pending_index += 1
-
-            print(
-                f"[{pending_index}/{pending_asset_count}] 검사: "
-                f"{asset.asset_id}"
-            )
-
-            # =====================================================
-            # YouTube
-            # URL 자체를 LLM 입력으로 사용하며 파일 다운로드하지 않음
-            # =====================================================
             if asset.platform == Platform.YOUTUBE:
                 youtube_url = (
                     asset.original_post_url
@@ -3034,23 +3030,36 @@ def process_media_assets(
                         "모두 없습니다."
                     )
 
-                processed_assets.append(asset)
+                processed_assets[index] = asset
                 continue
 
-            # =====================================================
-            # source URL 누락
-            # =====================================================
             if not asset.source_url:
                 asset.status = "source_url_missing"
                 asset.error_message = (
                     "source URL이 존재하지 않습니다."
                 )
-                processed_assets.append(asset)
+                processed_assets[index] = asset
                 continue
 
-            # =====================================================
-            # URL feasibility 검사
-            # =====================================================
+            pending_indexes.append(index)
+
+        # =====================================================
+        # 2차 패스 (병렬): URL feasibility 검사 + 실제 다운로드.
+        # asset마다 독립적인 HTTP 호출/파일 쓰기라 ThreadPoolExecutor로
+        # 안전하게 병렬화할 수 있다 (모듈 상단 MEDIA_DOWNLOAD_MAX_WORKERS
+        # 설명 참고).
+        # =====================================================
+        pending_asset_count = len(pending_indexes)
+        progress_lock = threading.Lock()
+        completed_count = 0
+
+        def _process_pending_asset(
+            index: int,
+        ) -> None:
+            nonlocal completed_count
+
+            asset = media_assets[index]
+
             feasibility = check_media_url(
                 asset=asset,
                 session=session,
@@ -3073,38 +3082,39 @@ def process_media_assets(
                 asset.error_message = (
                     feasibility.error_message
                 )
-                processed_assets.append(asset)
-
-                print(
-                    f"  실패: {asset.status} - "
-                    f"{asset.error_message}"
-                )
-                continue
-
-            # Raw Data의 media type보다 실제 응답 타입을 사용
-            asset.media_type = (
-                feasibility.detected_media_type
-            )
-
-            # =====================================================
-            # 실제 다운로드
-            # =====================================================
-            asset = download_media_asset(
-                asset=asset,
-                feasibility=feasibility,
-                local_media_root=local_media_root,
-                session=session,
-            )
-            processed_assets.append(asset)
-
-            if asset.status == "downloaded":
-                print(
-                    f"  저장 완료: {asset.local_path}"
-                )
             else:
-                print(
-                    "  다운로드 실패: "
-                    f"{asset.error_message}"
+                # Raw Data의 media type보다 실제 응답 타입을 사용
+                asset.media_type = (
+                    feasibility.detected_media_type
+                )
+
+                asset = download_media_asset(
+                    asset=asset,
+                    feasibility=feasibility,
+                    local_media_root=local_media_root,
+                    session=session,
+                )
+
+            processed_assets[index] = asset
+
+            with progress_lock:
+                completed_count += 1
+                progress_number = completed_count
+
+            print(
+                f"[{progress_number}/{pending_asset_count}] "
+                f"처리 완료: {asset.asset_id} -> {asset.status}"
+            )
+
+        if pending_indexes:
+            with ThreadPoolExecutor(
+                max_workers=MEDIA_DOWNLOAD_MAX_WORKERS
+            ) as executor:
+                list(
+                    executor.map(
+                        _process_pending_asset,
+                        pending_indexes,
+                    )
                 )
 
     return processed_assets

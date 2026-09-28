@@ -28,6 +28,7 @@ REQUIRED_PROJECT_FILES = (
     "sprinklr_export_excel.py",
     "raw_to_processed.py",
     "comment_extractor.py",
+    "consumer_reaction_url.py",
     "media_extractor.py",
     "llm_analysis_pipeline.py",
 )
@@ -42,6 +43,7 @@ BUZZ_VOLUME_MODULE = "buzz_volume_adaptor.py"
 MODULE_LABELS = {
     "sprinklr_export_excel.py": "Sprinklr Export",
     "raw_to_processed.py": "Raw → Processed",
+    "consumer_reaction_url.py": "Consumer Reaction URL",
     "media_extractor.py": "Media Extraction",
     "llm_analysis_pipeline.py": "LLM Analysis",
 }

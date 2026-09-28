@@ -3,6 +3,15 @@
 
 ## 2026-09-28
 
+### 최적화 2라운드 코드를 실제 파이프라인에 갈아끼움 (AFTER 측정 준비 완료, 아직 AFTER 실행 전)
+
+- 파일 이름은 그대로 두고 내용만 교체(Streamlit 등 다른 코드가 쓰는 이름 유지): `raw_to_processed.py` ← 2a(정제만, 체크포인트 포함), `comment_extractor.py` ← v2(채널 범용 YT/IG prefetch), `media_extractor.py` ← v2(병렬 다운로드). 중복 방지를 위해 `raw_to_processed_2a.py`, `comment_extractor_v2.py`, `media_extractor_v2.py`는 삭제(git 이력에 남음). BEFORE 원본은 `Back-up/`에 보관
+- `consumer_reaction_url.py`(2b)가 `comment_extractor_v2` 대신 `comment_extractor`를 import하도록 수정
+- `pipeline_service.py`: `CONSUMER_REACTION_MODULE` 신규 단계 추가(`FOLLOW_UP_MODULES`, `--overwrite` 인자, 의존성 검사: formatted Excel 필요), 전체 파이프라인 루프에서 2b와 3단계(media_extractor)를 `run_2b_and_3_concurrently()`로 **동시에** 실행하고 진행 표시는 두 단계를 함께 started/completed 처리, 이 함수가 `run_paths`를 직접 받도록 확장
+- `streamlit_app.py`: 필수 파일 목록과 모듈 라벨에 `consumer_reaction_url.py` 추가
+- 확인한 것: 모듈 import, 문법 컴파일, 모듈 목록/의존성 검사(260913 실행 폴더 기준 모두 통과). **실제 파이프라인 실행은 아직 하지 않음** — 2b 전체와 2b/3 동시 실행은 AFTER 측정이 첫 실전 실행
+- 손대지 않음: `run_pipeline.py`(옛 독립 복사본, 자체 목록/루프), `누락/` 폴더(자체 모듈 사본), 4단계는 2b 완료 여부를 파일로 확인하지 못하고 파이프라인 순서로만 보장됨(2b를 건너뛰고 4단계만 개별 실행하면 댓글 URL이 비어 있을 수 있음)
+
 ### 2b(`consumer_reaction_url.py`) 재실행 멱등성 및 오래된 체크포인트 문제 수정
 
 - **재실행 멱등성**: 2b가 이미 처리한 파일에 다시 돌면 URL 칸 값이 `게시물URL\n댓글URL`이라 이를 통째로 게시물 URL로 추출기에 넘기던 문제 → `extract_post_url()` 추가, 줄바꿈이 있으면 첫 줄만 게시물 URL로 사용(prefetch 대상 수집과 본 루프 모두)

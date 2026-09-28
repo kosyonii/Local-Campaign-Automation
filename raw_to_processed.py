@@ -28,10 +28,6 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 
 from openpyxl import load_workbook
-from comment_extractor import (
-    CommentExtractorSession,
-    build_url_cell_value,
-)
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -40,6 +36,11 @@ OUTPUT_BASE_DIR = BASE_DIR / "output"
 ENV_INPUT_DATE = "LOCAL_CAMPAIGN_INPUT_DATE"
 ENV_RUN_NUMBER = "LOCAL_CAMPAIGN_RUN_NUMBER"
 ENV_OUTPUT_DIR = "LOCAL_CAMPAIGN_OUTPUT_DIR"
+
+# 메모리 부족 등으로 프로세스가 외부에서 강제 종료되는 경우를 대비해
+# 워크북 + 진행 상태를 주기적으로 저장하고, 재실행 시 그 지점부터
+# 이어서 처리한다 (처음부터 다시 돌리지 않기 위함).
+CHECKPOINT_INTERVAL_SECONDS = 180.0
 
 # 절전모드 해제 직후 Wi-Fi가 아직 재연결되지 않은 상태에서
 # yt-dlp/gallery-dl DNS resolve가 통째로 실패하는 것을 막기 위한
@@ -51,11 +52,6 @@ NETWORK_READY_CHECK_HOSTS = (
 )
 NETWORK_READY_MAX_WAIT_SECONDS = 30.0
 NETWORK_READY_POLL_INTERVAL_SECONDS = 2.0
-
-# 메모리 부족 등으로 프로세스가 외부에서 강제 종료되는 경우를 대비해
-# 워크북 + 진행 상태를 주기적으로 저장하고, 재실행 시 그 지점부터
-# 이어서 처리한다 (처음부터 다시 돌리지 않기 위함).
-CHECKPOINT_INTERVAL_SECONDS = 180.0
 
 RAW_SHEET_NAMES = (
     "Raw Data_원문",
@@ -536,7 +532,6 @@ def process_one_sheet(
     output_columns: list[str],
     start_output_row: int,
     seen_urls: set[str],
-    comment_session: CommentExtractorSession,
     start_source_row: int | None = None,
     checkpoint_saver=None,
 ) -> int:
@@ -661,67 +656,6 @@ def process_one_sheet(
         column_name="Query",
     )
 
-    # 본 처리 루프 전에 이 시트의 YT permalink만 먼저 훑어서
-    # ThreadPoolExecutor로 병렬 prefetch한다 (Sprinklr 위젯과 동일한
-    # 패턴). YT는 session/브라우저 상태를 공유하지 않는 순수 yt-dlp
-    # 호출이라 병렬화가 안전하지만, X/FB/TT는 Playwright persistent
-    # context를 공유해서 이 방식을 적용할 수 없다.
-    #
-    # 여기서는 채널만 보고 대상을 추리기 때문에, 이후 본 루프에서
-    # created_time/conversation_stream 누락 등으로 실제로는 건너뛰는
-    # 행의 URL도 일부 prefetch될 수 있다 (허용 가능한 낭비이며
-    # 정확성에는 영향이 없다).
-    youtube_permalinks_to_prefetch: list[str] = []
-
-    for prefetch_row_idx in range(
-        header_row + 1,
-        source_ws.max_row + 1,
-    ):
-        raw_sn_type_for_prefetch = source_ws.cell(
-            row=prefetch_row_idx,
-            column=sn_type_col_idx,
-        ).value
-
-        if raw_sn_type_for_prefetch is None:
-            continue
-
-        if (
-            mapping_channel(
-                raw_sn_type_for_prefetch
-            )
-            != "YT"
-        ):
-            continue
-
-        permalink_for_prefetch = source_ws.cell(
-            row=prefetch_row_idx,
-            column=permalink_col_idx,
-        ).value
-
-        if permalink_for_prefetch is None:
-            continue
-
-        youtube_permalinks_to_prefetch.append(
-            str(
-                permalink_for_prefetch
-            ).strip()
-        )
-
-    if youtube_permalinks_to_prefetch:
-        print(
-            "[INFO] YT 댓글 URL "
-            f"{len(youtube_permalinks_to_prefetch)}건 "
-            "병렬 prefetch 시작..."
-        )
-
-        comment_session.prefetch_youtube_comment_urls(
-            youtube_permalinks_to_prefetch
-        )
-
-        print(
-            "[INFO] YT 댓글 URL prefetch 완료"
-        )
-
     output_row = start_output_row
     written_count = 0
     skipped_duplicate_count = 0
@@ -810,12 +744,10 @@ def process_one_sheet(
             plain_url
         )
 
-        url_cell_value = build_url_cell_value(
-            channel=channel,
-            post_url=plain_url,
-            session=comment_session,
-            raise_on_error=False
-        )
+        # URL 컬럼에는 Permalink만 저장한다.
+        # 소비자 댓글/reply URL 추출은 2b(consumer_reaction_url.py)가
+        # 이 formatted.xlsx를 이어받아 처리한다.
+        url_cell_value = plain_url
 
         target_ws.cell(
             row=output_row,
@@ -1172,6 +1104,10 @@ def cleanup_temporary_output(
         temporary_output_path.unlink()
 
 
+# =========================================================
+# 7. Main Function
+# =========================================================
+
 def checkpoint_paths(
     output_path: Path,
 ) -> tuple[Path, Path]:
@@ -1382,10 +1318,6 @@ def wait_for_network_ready(
         time.sleep(poll_interval_seconds)
 
 
-# =========================================================
-# 7. Main Function
-# =========================================================
-
 def main() -> None:
     run_started_at = time.monotonic()
 
@@ -1426,13 +1358,6 @@ def main() -> None:
 
     print(f"Input file: {input_path}")
     print(f"Output file: {output_path}")
-
-    wait_for_network_ready()
-
-    # X / FB / TT의 브라우저 context를 전체 Raw 처리 동안
-    # 하나의 session에서 재사용한다. 실제 Playwright/브라우저 연결은
-    # 해당 플랫폼이 처음 등장할 때 lazy하게 생성된다.
-    comment_session = CommentExtractorSession()
 
     checkpoint_workbook, checkpoint_progress = load_checkpoint(
         checkpoint_xlsx_path,
@@ -1518,7 +1443,6 @@ def main() -> None:
                 output_columns=OUTPUT_COLUMNS,
                 start_output_row=output_row,
                 seen_urls=seen_urls,
-                comment_session=comment_session,
                 start_source_row=start_source_row,
                 checkpoint_saver=checkpoint_saver,
             )
@@ -1564,27 +1488,6 @@ def main() -> None:
         )
         raise
 
-    finally:
-        # before/after 소요시간 비교용 채널별/URL별 raw 기록을
-        # 같은 실행 차수 output 폴더에 남긴다 (성공/실패 여부와 무관하게 남김).
-        timing_csv_path = (
-            output_dir / "comment_extraction_timings.csv"
-        )
-
-        try:
-            comment_session.export_call_records_csv(
-                timing_csv_path
-            )
-        except Exception as exc:
-            print(
-                "[WARNING] 댓글 추출 소요시간 CSV 저장 실패: "
-                f"{type(exc).__name__}: {exc}"
-            )
-
-        # 전체 Raw 시트 처리가 끝난 뒤 X / FB persistent context와
-        # TikTok CDP 연결, Playwright를 한 번만 정리한다.
-        comment_session.close()
-
     total_output_rows = max(
         output_row - 2,
         0,
@@ -1609,10 +1512,6 @@ def main() -> None:
         "[TIMING] raw_to_processed.py total elapsed: "
         f"{total_elapsed_seconds:.1f}s "
         f"({total_elapsed_seconds / 60:.1f}min)"
-    )
-    print(
-        "[TIMING] comment extraction timing CSV: "
-        f"{timing_csv_path}"
     )
 
 

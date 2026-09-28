@@ -65,8 +65,17 @@ LOGGER = logging.getLogger(__name__)
 # persistent context를 공유해서 이 방식을 적용할 수 없다).
 # 캐시에 "값이 없음(None)"과 "아직 prefetch 안 됨"을 구분하기 위한 sentinel.
 _YOUTUBE_CACHE_MISS = object()
+_PREFETCH_CACHE_MISS = _YOUTUBE_CACHE_MISS
 
 YOUTUBE_PREFETCH_MAX_WORKERS = 6
+
+# IG는 YT보다 평균 호출 시간이 훨씬 짧아(실측: YT 평균 22s대 vs IG 평균
+# 2s대) 더 높은 동시성을 줘도 안전하다. YT와 별도 채널로 병렬 prefetch한다.
+INSTAGRAM_PREFETCH_MAX_WORKERS = 12
+
+# 채널별 prefetch에 사용할 순수(세션/브라우저 비공유) 추출 함수.
+# 실제 등록은 각 함수 정의 이후, 모듈 하단에서 채운다.
+_PREFETCHABLE_EXTRACTORS: dict[str, Any] = {}
 
 SUPPORTED_CHANNELS = {
     "YT",
@@ -652,6 +661,13 @@ def extract_instagram_comment_url(
     )
 
 
+# YT/IG는 session이나 브라우저 상태를 공유하지 않는 순수 yt-dlp 호출이라
+# ThreadPoolExecutor로 안전하게 병렬 prefetch할 수 있다. X/FB/TT는
+# Playwright persistent context를 세션 전체에서 공유해서 이 방식을
+# 적용할 수 없다.
+_PREFETCHABLE_EXTRACTORS["YT"] = extract_youtube_comment_url
+_PREFETCHABLE_EXTRACTORS["IG"] = extract_instagram_comment_url
+
 
 # =============================================================================
 # Browser Session Manager
@@ -696,10 +712,10 @@ class CommentExtractorSession:
         # (채널, URL, 성공 여부, 오류 여부, 소요시간)을 호출마다 남긴다.
         self._call_records: list[dict[str, Any]] = []
 
-        # prefetch_youtube_comment_urls()가 채워두는 YT 결과 캐시.
-        # extract_comment_url()의 YT 분기가 여기서 먼저 소비한다.
-        self._youtube_cache_lock = threading.Lock()
-        self._youtube_prefetch_cache: dict[str, Any] = {}
+        # prefetch_comment_urls()가 채널별로 채워두는 결과 캐시.
+        # extract_comment_url()의 YT/IG 분기가 여기서 먼저 소비한다.
+        self._prefetch_cache_lock = threading.Lock()
+        self._prefetch_cache: dict[str, dict[str, Any]] = {}
 
         self._closed = False
 
@@ -828,27 +844,38 @@ class CommentExtractorSession:
             for record in records:
                 writer.writerow(record)
 
-    def prefetch_youtube_comment_urls(
+    def prefetch_comment_urls(
         self,
+        channel: str,
         post_urls: Iterable[str],
         *,
-        max_workers: int = YOUTUBE_PREFETCH_MAX_WORKERS,
+        max_workers: int,
     ) -> None:
         """
-        YT 댓글 URL 추출을 ThreadPoolExecutor로 미리 병렬 실행해서
-        self._youtube_prefetch_cache를 채운다.
+        YT/IG 댓글 URL 추출을 ThreadPoolExecutor로 미리 병렬 실행해서
+        self._prefetch_cache[channel]을 채운다.
 
-        extract_youtube_comment_url()/_extract_with_ytdlp()는 세션이나
-        브라우저 상태를 공유하지 않는 순수 호출이라 (Sprinklr 위젯과 동일한
-        패턴으로) 안전하게 병렬화할 수 있다. X/FB/TT는 Playwright
-        persistent context 하나를 세션 전체에서 재사용하므로 이 방식을
-        적용할 수 없다.
+        extract_youtube_comment_url() / extract_instagram_comment_url()은
+        session이나 브라우저 상태를 공유하지 않는 순수 호출이라
+        (Sprinklr 위젯과 동일한 패턴으로) 안전하게 병렬화할 수 있다.
+        X/FB/TT는 Playwright persistent context 하나를 세션 전체에서
+        재사용하므로 이 방식을 적용할 수 없다.
+
+        채널별로 평균 호출 시간이 크게 다르므로(YT가 IG보다 훨씬 느림)
+        max_workers는 채널마다 다르게 호출부에서 지정한다.
 
         개별 URL의 성공/실패와 관계없이 record_comment_result()로
-        건별 통계를 남기며, 이후 extract_comment_url()의 YT 분기가
-        pop_cached_youtube_result()로 캐시를 소비할 때는 다시 기록하지
-        않는다 (중복 집계 방지).
+        건별 통계를 남기며, 이후 extract_comment_url()이
+        pop_cached_result()로 캐시를 소비할 때는 다시 기록하지 않는다
+        (중복 집계 방지).
         """
+
+        extractor = _PREFETCHABLE_EXTRACTORS.get(channel)
+
+        if extractor is None:
+            raise ValueError(
+                f"prefetch를 지원하지 않는 channel입니다: {channel}"
+            )
 
         normalized_urls = {
             normalized
@@ -868,16 +895,12 @@ class CommentExtractorSession:
             call_started_at = time.monotonic()
 
             try:
-                comment_url = (
-                    extract_youtube_comment_url(
-                        url
-                    )
-                )
+                comment_url = extractor(url)
             except Exception as exc:
                 self.record_comment_result(
                     extracted=False,
                     error=True,
-                    channel="YT",
+                    channel=channel,
                     url=url,
                     duration_seconds=(
                         time.monotonic()
@@ -886,8 +909,9 @@ class CommentExtractorSession:
                 )
 
                 LOGGER.debug(
-                    "[YT PREFETCH FAILED] url=%s, "
+                    "[%s PREFETCH FAILED] url=%s, "
                     "%s: %s",
+                    channel,
                     url,
                     type(exc).__name__,
                     exc,
@@ -902,7 +926,7 @@ class CommentExtractorSession:
                         comment_url is not None
                     ),
                     error=False,
-                    channel="YT",
+                    channel=channel,
                     url=url,
                     duration_seconds=(
                         time.monotonic()
@@ -910,10 +934,10 @@ class CommentExtractorSession:
                     ),
                 )
 
-            with self._youtube_cache_lock:
-                self._youtube_prefetch_cache[url] = (
-                    comment_url
-                )
+            with self._prefetch_cache_lock:
+                self._prefetch_cache.setdefault(
+                    channel, {}
+                )[url] = comment_url
 
         with ThreadPoolExecutor(
             max_workers=max_workers
@@ -925,24 +949,66 @@ class CommentExtractorSession:
                 )
             )
 
-    def pop_cached_youtube_result(
+    def prefetch_youtube_comment_urls(
         self,
+        post_urls: Iterable[str],
+        *,
+        max_workers: int = YOUTUBE_PREFETCH_MAX_WORKERS,
+    ) -> None:
+        """하위 호환용 얇은 래퍼. prefetch_comment_urls("YT", ...)와 동일."""
+
+        self.prefetch_comment_urls(
+            "YT",
+            post_urls,
+            max_workers=max_workers,
+        )
+
+    def prefetch_instagram_comment_urls(
+        self,
+        post_urls: Iterable[str],
+        *,
+        max_workers: int = INSTAGRAM_PREFETCH_MAX_WORKERS,
+    ) -> None:
+        """prefetch_comment_urls("IG", ...)의 얇은 래퍼."""
+
+        self.prefetch_comment_urls(
+            "IG",
+            post_urls,
+            max_workers=max_workers,
+        )
+
+    def pop_cached_result(
+        self,
+        channel: str,
         post_url: str,
     ) -> Any:
         """
-        prefetch_youtube_comment_urls()가 채워둔 캐시에서 결과를 꺼낸다.
+        prefetch_comment_urls()가 채워둔 캐시에서 결과를 꺼낸다.
 
-        캐시에 없으면 _YOUTUBE_CACHE_MISS sentinel을 반환한다
+        캐시에 없으면 _PREFETCH_CACHE_MISS sentinel을 반환한다
         (캐시된 값이 None인 경우와 구분하기 위함). 한 번 소비한 URL은
         제거해서 (seen_urls로 이미 전역 중복 제거되므로 동일 URL이
         다시 조회될 일은 없지만) 메모리를 불필요하게 들고 있지 않는다.
         """
 
-        with self._youtube_cache_lock:
-            return self._youtube_prefetch_cache.pop(
+        with self._prefetch_cache_lock:
+            channel_cache = self._prefetch_cache.get(channel)
+
+            if channel_cache is None:
+                return _PREFETCH_CACHE_MISS
+
+            return channel_cache.pop(
                 post_url,
-                _YOUTUBE_CACHE_MISS,
+                _PREFETCH_CACHE_MISS,
             )
+
+    def pop_cached_youtube_result(
+        self,
+        post_url: str,
+    ) -> Any:
+        """하위 호환용 얇은 래퍼. pop_cached_result("YT", ...)와 동일."""
+
+        return self.pop_cached_result("YT", post_url)
 
     def print_comment_summary(
         self,
@@ -3628,17 +3694,18 @@ def extract_comment_url(
         or get_default_comment_extractor_session()
     )
 
-    # prefetch_youtube_comment_urls()로 미리 병렬 fetch해둔 결과가 있으면
+    # prefetch_comment_urls()로 미리 병렬 fetch해둔 결과가 있으면
     # 그대로 사용한다 (record_comment_result는 prefetch 시점에 이미
-    # 기록했으므로 여기서는 다시 기록하지 않는다).
-    if normalized_channel == "YT":
+    # 기록했으므로 여기서는 다시 기록하지 않는다). YT/IG 둘 다 대상.
+    if normalized_channel in _PREFETCHABLE_EXTRACTORS:
         cached_comment_url = (
-            stats_session.pop_cached_youtube_result(
-                normalized_post_url
+            stats_session.pop_cached_result(
+                normalized_channel,
+                normalized_post_url,
             )
         )
 
-        if cached_comment_url is not _YOUTUBE_CACHE_MISS:
+        if cached_comment_url is not _PREFETCH_CACHE_MISS:
             return normalize_url(
                 cached_comment_url
             )
