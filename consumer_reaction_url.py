@@ -123,6 +123,38 @@ def cleanup_temporary_path(
         temporary_path.unlink()
 
 
+def source_fingerprint(
+    path: Path,
+) -> str:
+    """
+    체크포인트가 어떤 formatted Excel을 기준으로 만들어졌는지 식별한다.
+    2a가 formatted Excel을 새로 만들면 (수정 시각/크기가 바뀌면)
+    이전 체크포인트는 옛 데이터 기준이므로 재사용하면 안 된다.
+    """
+
+    stat = path.stat()
+
+    return f"{stat.st_mtime_ns}:{stat.st_size}"
+
+
+def extract_post_url(
+    raw_url,
+) -> str | None:
+    """
+    URL 컬럼 값에서 게시물 URL만 꺼낸다.
+
+    2b가 이미 처리한 파일을 다시 처리하는 경우 셀 값이
+    "POST_URL(줄바꿈)COMMENT_URL" 형식이므로 첫 줄만 게시물 URL로 사용한다.
+    """
+
+    if raw_url is None:
+        return None
+
+    first_line = str(raw_url).strip().split("\n", 1)[0]
+
+    return normalize_url(first_line)
+
+
 def checkpoint_paths(
     formatted_excel_path: Path,
 ) -> tuple[Path, Path]:
@@ -143,12 +175,14 @@ def checkpoint_paths(
 def load_checkpoint(
     checkpoint_xlsx_path: Path,
     checkpoint_json_path: Path,
+    expected_fingerprint: str,
 ):
     """
     이전 실행이 남긴 체크포인트가 있으면 불러온다.
 
-    둘 중 하나라도 없거나 손상되어 읽을 수 없으면
-    (None, None)을 반환해 처음부터 새로 시작하게 한다.
+    둘 중 하나라도 없거나 손상되어 읽을 수 없거나, 체크포인트가 다른
+    (이전) formatted Excel 기준으로 만들어졌으면 (None, None)을 반환해
+    처음부터 새로 시작하게 한다.
     """
 
     if (
@@ -170,6 +204,14 @@ def load_checkpoint(
         )
         return None, None
 
+    if progress.get("source_fingerprint") != expected_fingerprint:
+        print(
+            "[WARNING] 체크포인트가 현재 formatted Excel과 "
+            "다른 파일 기준으로 만들어져 있어(2a가 새로 생성했거나 "
+            "옛 형식) 무시하고 처음부터 시작합니다."
+        )
+        return None, None
+
     return workbook, progress
 
 
@@ -177,6 +219,7 @@ def make_checkpoint_saver(
     workbook,
     checkpoint_xlsx_path: Path,
     checkpoint_json_path: Path,
+    fingerprint: str,
     interval_seconds: float = CHECKPOINT_INTERVAL_SECONDS,
 ):
     """
@@ -207,6 +250,7 @@ def make_checkpoint_saver(
         os.replace(temp_xlsx_path, checkpoint_xlsx_path)
 
         payload = {
+            "source_fingerprint": fingerprint,
             "next_row": next_row,
             "processed_count": processed_count,
             "reaction_found_count": reaction_found_count,
@@ -325,13 +369,15 @@ def process_reaction_sheet(
         if normalized_channel not in permalinks_to_prefetch:
             continue
 
-        raw_url = ws.cell(row=row_idx, column=url_col_idx).value
+        prefetch_url = extract_post_url(
+            ws.cell(row=row_idx, column=url_col_idx).value
+        )
 
-        if raw_url is None:
+        if prefetch_url is None:
             continue
 
         permalinks_to_prefetch[normalized_channel].append(
-            str(raw_url).strip()
+            prefetch_url
         )
 
     for channel, urls in permalinks_to_prefetch.items():
@@ -372,7 +418,7 @@ def process_reaction_sheet(
         if raw_channel is None or raw_url is None:
             continue
 
-        post_url = normalize_url(raw_url)
+        post_url = extract_post_url(raw_url)
 
         if post_url is None:
             continue
@@ -477,9 +523,12 @@ def main() -> None:
 
     comment_session = CommentExtractorSession()
 
+    excel_fingerprint = source_fingerprint(formatted_excel_path)
+
     checkpoint_workbook, checkpoint_progress = load_checkpoint(
         checkpoint_xlsx_path,
         checkpoint_json_path,
+        excel_fingerprint,
     )
 
     try:
@@ -516,6 +565,7 @@ def main() -> None:
             workbook=workbook,
             checkpoint_xlsx_path=checkpoint_xlsx_path,
             checkpoint_json_path=checkpoint_json_path,
+            fingerprint=excel_fingerprint,
         )
 
         processed_count, reaction_found_count = process_reaction_sheet(

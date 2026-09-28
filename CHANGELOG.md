@@ -3,6 +3,13 @@
 
 ## 2026-09-28
 
+### 2b(`consumer_reaction_url.py`) 재실행 멱등성 및 오래된 체크포인트 문제 수정
+
+- **재실행 멱등성**: 2b가 이미 처리한 파일에 다시 돌면 URL 칸 값이 `게시물URL\n댓글URL`이라 이를 통째로 게시물 URL로 추출기에 넘기던 문제 → `extract_post_url()` 추가, 줄바꿈이 있으면 첫 줄만 게시물 URL로 사용(prefetch 대상 수집과 본 루프 모두)
+- **오래된 체크포인트**: 2a가 formatted Excel을 새로 만든 뒤에도 옛 체크포인트 워크북에서 조용히 이어가던 문제 → 체크포인트 JSON에 `source_fingerprint`(formatted Excel의 수정 시각+크기)를 저장하고, 불러올 때 현재 파일과 다르거나 값이 없으면 경고 후 무시하고 처음부터 시작
+- 검증(네트워크 없이 가짜 추출기로): 같은 시트를 2번 처리해도 두 번 다 깨끗한 permalink가 추출기에 전달됨, 같은 원본이면 이어하기, 원본이 바뀌었거나 fingerprint 없는 옛 체크포인트는 무시됨. 실제 2b 전체 실행은 하지 않음
+- 남은 위험: prefetch 구간 중 체크포인트 없음(시간 손해만, 그대로 둠), IG 동시 요청 증가(AFTER 측정에서 IG 실패 건수로 확인 예정)
+
 ### BEFORE 파일 복원 + 체크포인트 기능 유지 및 2a 이식
 
 - `raw_to_processed.py`/`comment_extractor.py`를 BEFORE 측정용 559303b 상태에서 HEAD로 복원(YT 병렬 prefetch 복귀). 복원 전에 측정에 쓴 버전을 `Back-up/raw_to_processed_case2_BEFORE_with_checkpoint.py`, `Back-up/comment_extractor_case2_BEFORE_559303b.py`로 보관
