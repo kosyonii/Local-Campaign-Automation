@@ -26,7 +26,7 @@ from pathlib import Path
 
 from openpyxl import load_workbook
 
-from comment_extractor_v2 import (
+from comment_extractor import (
     CommentExtractorSession,
     build_url_cell_value,
     INSTAGRAM_PREFETCH_MAX_WORKERS,
@@ -347,7 +347,7 @@ def process_reaction_sheet(
     # 상태를 공유하지 않는 순수 yt-dlp 호출이라 병렬화가 안전하지만,
     # X/FB/TT는 Playwright persistent context를 공유해서 이 방식을
     # 적용할 수 없다. 채널별 평균 호출 시간 차이(YT >> IG)에 맞춰
-    # max_workers도 채널마다 다르게 준다 (comment_extractor_v2.py 참고).
+    # max_workers도 채널마다 다르게 준다 (comment_extractor.py 참고).
     loop_start_row = max(
         header_row + 1,
         start_row if start_row is not None else header_row + 1,

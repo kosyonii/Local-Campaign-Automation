@@ -56,9 +56,20 @@ BUZZ_VOLUME_MODULE = "buzz_volume_adaptor.py"
 BUZZ_VOLUME_PAYLOAD = PROJECT_ROOT / "payload" / "buzz_volume_base_payload.json"
 BUZZ_VOLUME_DAILY_START_DATE = date(2026, 7, 1)
 
+CONSUMER_REACTION_MODULE = "consumer_reaction_url.py"
+MEDIA_EXTRACTOR_MODULE = "media_extractor.py"
+
+# 2b(소비자 반응 URL)와 3단계(미디어 추출)는 서로 다른 파일을 읽고 쓰는
+# 독립 브랜치라서 전체 파이프라인에서는 동시에 실행한다.
+CONCURRENT_STEP_MODULES = (
+    CONSUMER_REACTION_MODULE,
+    MEDIA_EXTRACTOR_MODULE,
+)
+
 FOLLOW_UP_MODULES = (
     "raw_to_processed.py",
-    "media_extractor.py",
+    CONSUMER_REACTION_MODULE,
+    MEDIA_EXTRACTOR_MODULE,
     "llm_analysis_pipeline.py",
 )
 
@@ -70,6 +81,7 @@ PIPELINE_MODULES = (
 MODULE_OVERWRITE_ARGUMENTS = {
     "sprinklr_export_excel.py": "--overwrite",
     "raw_to_processed.py": "--overwrite",
+    CONSUMER_REACTION_MODULE: "--overwrite",
     "media_extractor.py": "--overwrite",
     "llm_analysis_pipeline.py": "--overwrite-results",
 }
@@ -774,6 +786,14 @@ def run_local_campaign_pipeline(
         module_jobs
     )
 
+    step_number_by_module = {
+        module_name: step_number
+        for step_number, (module_name, _inputs) in enumerate(
+            module_jobs,
+            start=1,
+        )
+    }
+
     for current_step, (
         module_name,
         module_inputs,
@@ -781,6 +801,42 @@ def run_local_campaign_pipeline(
         module_jobs,
         start=1,
     ):
+        if module_name == MEDIA_EXTRACTOR_MODULE:
+            # 2b 단계에서 동시에 실행하고 완료했다.
+            continue
+
+        if module_name == CONSUMER_REACTION_MODULE:
+            for concurrent_module in CONCURRENT_STEP_MODULES:
+                _emit_progress(
+                    current_step=step_number_by_module[
+                        concurrent_module
+                    ],
+                    total_steps=total_steps,
+                    module_name=concurrent_module,
+                    status="started",
+                    progress_callback=progress_callback,
+                )
+
+            run_2b_and_3_concurrently(
+                input_date=input_date,
+                run_number=run_paths.run_number,
+                run_paths=run_paths,
+                log_callback=log_callback,
+            )
+
+            for concurrent_module in CONCURRENT_STEP_MODULES:
+                _emit_progress(
+                    current_step=step_number_by_module[
+                        concurrent_module
+                    ],
+                    total_steps=total_steps,
+                    module_name=concurrent_module,
+                    status="completed",
+                    progress_callback=progress_callback,
+                )
+
+            continue
+
         _emit_progress(
             current_step=current_step,
             total_steps=total_steps,
@@ -1096,6 +1152,17 @@ def validate_module_dependencies(
             )
         )
 
+    elif module_name == CONSUMER_REACTION_MODULE:
+        # 2b는 2a(raw_to_processed.py)가 만든 formatted Excel을
+        # 읽어서 URL 컬럼을 그 자리에서 갱신한다.
+        checks.append(
+            ModuleDependencyCheck(
+                name="Formatted Excel (2a 결과)",
+                passed=artifacts["formatted_excel"].is_file(),
+                detail=str(artifacts["formatted_excel"]),
+            )
+        )
+
     elif module_name == "media_extractor.py":
         # media_extractor.py는 Processed Excel이 아니라
         # 같은 실행 차수의 Sprinklr Raw Excel(Raw Data 시트)을 읽는다.
@@ -1316,10 +1383,11 @@ def run_2b_and_3_concurrently(
     input_date: str,
     run_number: int,
     *,
-    consumer_reaction_module: str = "consumer_reaction_url.py",
-    media_extractor_module: str = "media_extractor_v2.py",
+    consumer_reaction_module: str = CONSUMER_REACTION_MODULE,
+    media_extractor_module: str = MEDIA_EXTRACTOR_MODULE,
     overwrite_existing: bool = False,
     log_callback: LogCallback | None = None,
+    run_paths=None,
 ) -> None:
     """
     (5) 2b(소비자 반응 URL 추출)와 3단계(media_extractor)를 동시에 실행한다.
@@ -1334,19 +1402,20 @@ def run_2b_and_3_concurrently(
     run_module()을 두 스레드에서 호출만 한다 (module_timings.csv
     동시 기록은 _MODULE_TIMING_CSV_LOCK으로 보호됨).
 
-    media_extractor_module 기본값은 아직 검증 중인 media_extractor_v2.py다.
-    검증 후 원본 media_extractor.py로 교체(swap-in)할 예정이며, 그 전까지는
-    이 함수를 실제 운영 파이프라인에 연결하지 않는다.
+    run_local_campaign_pipeline()이 2b/3단계 구간에서 이 함수를 호출한다.
+    run_paths를 넘기면 그 실행 폴더를 그대로 쓰고, 없으면 기존 차수 폴더를
+    input_date/run_number로 찾는다.
     """
 
     normalized_date = validate_input_date(
         input_date
     )
 
-    run_paths = resolve_existing_run_paths(
-        input_date=normalized_date,
-        run_number=run_number,
-    )
+    if run_paths is None:
+        run_paths = resolve_existing_run_paths(
+            input_date=normalized_date,
+            run_number=run_number,
+        )
 
     module_inputs = [normalized_date]
 
