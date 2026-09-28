@@ -19,10 +19,11 @@
 # =========================================================
 
 import argparse
+import json
 import os
 import re
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 from openpyxl import load_workbook
@@ -34,6 +35,11 @@ OUTPUT_BASE_DIR = BASE_DIR / "output"
 ENV_INPUT_DATE = "LOCAL_CAMPAIGN_INPUT_DATE"
 ENV_RUN_NUMBER = "LOCAL_CAMPAIGN_RUN_NUMBER"
 ENV_OUTPUT_DIR = "LOCAL_CAMPAIGN_OUTPUT_DIR"
+
+# 메모리 부족 등으로 프로세스가 외부에서 강제 종료되는 경우를 대비해
+# 워크북 + 진행 상태를 주기적으로 저장하고, 재실행 시 그 지점부터
+# 이어서 처리한다 (처음부터 다시 돌리지 않기 위함).
+CHECKPOINT_INTERVAL_SECONDS = 180.0
 
 RAW_SHEET_NAMES = (
     "Raw Data_원문",
@@ -514,12 +520,17 @@ def process_one_sheet(
     output_columns: list[str],
     start_output_row: int,
     seen_urls: set[str],
+    start_source_row: int | None = None,
+    checkpoint_saver=None,
 ) -> int:
     """
     Raw Data 시트 하나를 읽어 결과 시트에 작성한다.
 
     Influencer 및 Subsidiary 결과는 이 단계에서 추정하지 않는다.
     해당 컬럼은 이후 LLM 분석 단계에서 채운다.
+
+    start_source_row가 주어지면 (체크포인트에서 재개하는 경우)
+    해당 원본 행부터 처리를 시작한다.
 
     처리 후 다음에 작성할 output row 번호를 반환한다.
     """
@@ -637,10 +648,25 @@ def process_one_sheet(
     written_count = 0
     skipped_duplicate_count = 0
 
-    for row_idx in range(
+    loop_start_row = max(
         header_row + 1,
+        start_source_row
+        if start_source_row is not None
+        else header_row + 1,
+    )
+
+    for row_idx in range(
+        loop_start_row,
         source_ws.max_row + 1,
     ):
+        if checkpoint_saver is not None:
+            checkpoint_saver(
+                current_sheet=source_ws.title,
+                next_source_row=row_idx,
+                output_row=output_row,
+                seen_urls=seen_urls,
+            )
+
         raw_created_time = source_ws.cell(
             row=row_idx,
             column=created_time_col_idx,
@@ -1070,6 +1096,160 @@ def cleanup_temporary_output(
 # 7. Main Function
 # =========================================================
 
+def checkpoint_paths(
+    output_path: Path,
+) -> tuple[Path, Path]:
+    """
+    중간 저장(체크포인트) 워크북 및 진행 상태 JSON 경로를 반환한다.
+    """
+
+    checkpoint_xlsx_path = output_path.with_name(
+        f".{output_path.stem}.checkpoint.xlsx"
+    )
+    checkpoint_json_path = output_path.with_name(
+        f".{output_path.stem}.checkpoint.json"
+    )
+
+    return checkpoint_xlsx_path, checkpoint_json_path
+
+
+def load_checkpoint(
+    checkpoint_xlsx_path: Path,
+    checkpoint_json_path: Path,
+):
+    """
+    이전 실행이 남긴 체크포인트가 있으면 불러온다.
+
+    둘 중 하나라도 없거나 손상되어 읽을 수 없으면
+    (None, None)을 반환해 처음부터 새로 시작하게 한다.
+    """
+
+    if (
+        not checkpoint_xlsx_path.is_file()
+        or not checkpoint_json_path.is_file()
+    ):
+        return None, None
+
+    try:
+        progress = json.loads(
+            checkpoint_json_path.read_text(
+                encoding="utf-8"
+            )
+        )
+        workbook = load_workbook(
+            checkpoint_xlsx_path
+        )
+    except Exception as exc:
+        print(
+            "[WARNING] 체크포인트를 읽지 못해 "
+            "처음부터 다시 시작합니다: "
+            f"{type(exc).__name__}: {exc}"
+        )
+        return None, None
+
+    return workbook, progress
+
+
+def make_checkpoint_saver(
+    workbook,
+    checkpoint_xlsx_path: Path,
+    checkpoint_json_path: Path,
+    completed_sheets: set[str],
+    interval_seconds: float = CHECKPOINT_INTERVAL_SECONDS,
+):
+    """
+    workbook + 진행 상태를 주기적으로(interval_seconds마다) 원자적으로
+    저장하는 콜백을 만든다. 임시 파일에 저장 후 os.replace로 교체하므로
+    저장 도중 프로세스가 죽어도 기존 체크포인트는 손상되지 않는다.
+    """
+
+    state = {
+        "last_saved_at": 0.0,
+    }
+
+    def save(
+        *,
+        current_sheet: str | None,
+        next_source_row: int | None,
+        output_row: int,
+        seen_urls: set[str],
+        force: bool = False,
+    ) -> None:
+        now = time.monotonic()
+
+        if (
+            not force
+            and (now - state["last_saved_at"])
+            < interval_seconds
+        ):
+            return
+
+        temp_xlsx_path = checkpoint_xlsx_path.with_suffix(
+            ".tmp.xlsx"
+        )
+        workbook.save(temp_xlsx_path)
+        os.replace(
+            temp_xlsx_path,
+            checkpoint_xlsx_path,
+        )
+
+        payload = {
+            "current_sheet": current_sheet,
+            "next_source_row": next_source_row,
+            "output_row": output_row,
+            "seen_urls": sorted(seen_urls),
+            "completed_sheets": sorted(
+                completed_sheets
+            ),
+            "saved_at": datetime.now(
+                timezone.utc
+            ).isoformat(),
+        }
+
+        temp_json_path = checkpoint_json_path.with_suffix(
+            ".tmp.json"
+        )
+        temp_json_path.write_text(
+            json.dumps(
+                payload,
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        os.replace(
+            temp_json_path,
+            checkpoint_json_path,
+        )
+
+        state["last_saved_at"] = now
+
+        print(
+            "[CHECKPOINT] 저장 완료 "
+            f"(sheet={current_sheet}, "
+            f"next_row={next_source_row}, "
+            f"output_row={output_row})"
+        )
+
+    return save
+
+
+def cleanup_checkpoint(
+    checkpoint_xlsx_path: Path,
+    checkpoint_json_path: Path,
+) -> None:
+    """
+    정상 완료 후 더 이상 필요 없는 체크포인트 파일을 정리한다.
+    """
+
+    for path in (
+        checkpoint_xlsx_path,
+        checkpoint_json_path,
+    ):
+        if path.exists():
+            path.unlink()
+
+
 def main() -> None:
     run_started_at = time.monotonic()
 
@@ -1104,22 +1284,65 @@ def main() -> None:
         overwrite=args.overwrite,
     )
 
+    checkpoint_xlsx_path, checkpoint_json_path = (
+        checkpoint_paths(output_path)
+    )
+
     print(f"Input file: {input_path}")
     print(f"Output file: {output_path}")
 
+    checkpoint_workbook, checkpoint_progress = load_checkpoint(
+        checkpoint_xlsx_path,
+        checkpoint_json_path,
+    )
+
     try:
-        workbook = load_workbook(
-            input_path
-        )
+        if checkpoint_workbook is not None:
+            print(
+                "[CHECKPOINT] 이전 실행의 중간 저장을 "
+                "발견해 이어서 진행합니다: "
+                f"{checkpoint_progress}"
+            )
 
-        target_ws = make_new_sheet(
+            workbook = checkpoint_workbook
+            target_ws = workbook[NEW_SHEET_NAME]
+            output_row = checkpoint_progress["output_row"]
+            seen_urls: set[str] = set(
+                checkpoint_progress["seen_urls"]
+            )
+            completed_sheets: set[str] = set(
+                checkpoint_progress["completed_sheets"]
+            )
+            resume_sheet = checkpoint_progress.get(
+                "current_sheet"
+            )
+            resume_row = checkpoint_progress.get(
+                "next_source_row"
+            )
+        else:
+            workbook = load_workbook(
+                input_path
+            )
+
+            target_ws = make_new_sheet(
+                workbook=workbook,
+                new_sheet_name=NEW_SHEET_NAME,
+                output_columns=OUTPUT_COLUMNS,
+            )
+
+            output_row = 2
+            seen_urls = set()
+            completed_sheets = set()
+            resume_sheet = None
+            resume_row = None
+
+        checkpoint_saver = make_checkpoint_saver(
             workbook=workbook,
-            new_sheet_name=NEW_SHEET_NAME,
-            output_columns=OUTPUT_COLUMNS,
+            checkpoint_xlsx_path=checkpoint_xlsx_path,
+            checkpoint_json_path=checkpoint_json_path,
+            completed_sheets=completed_sheets,
         )
 
-        output_row = 2
-        seen_urls: set[str] = set()
         processed_sheet_count = 0
 
         for sheet_name in RAW_SHEET_NAMES:
@@ -1130,7 +1353,21 @@ def main() -> None:
                 )
                 continue
 
+            if sheet_name in completed_sheets:
+                print(
+                    f"[CHECKPOINT] {sheet_name}: "
+                    "이전 실행에서 이미 완료됨 - 건너뜀"
+                )
+                processed_sheet_count += 1
+                continue
+
             source_ws = workbook[sheet_name]
+
+            start_source_row = (
+                resume_row
+                if sheet_name == resume_sheet
+                else None
+            )
 
             output_row = process_one_sheet(
                 source_ws=source_ws,
@@ -1138,9 +1375,22 @@ def main() -> None:
                 output_columns=OUTPUT_COLUMNS,
                 start_output_row=output_row,
                 seen_urls=seen_urls,
+                start_source_row=start_source_row,
+                checkpoint_saver=checkpoint_saver,
             )
 
+            completed_sheets.add(sheet_name)
             processed_sheet_count += 1
+
+            # 시트 경계에서는 시간 간격과 무관하게 항상 저장해서
+            # 다음 시트를 처음부터 다시 처리하지 않도록 한다.
+            checkpoint_saver(
+                current_sheet=None,
+                next_source_row=None,
+                output_row=output_row,
+                seen_urls=seen_urls,
+                force=True,
+            )
 
         if processed_sheet_count == 0:
             raise ValueError(
@@ -1156,6 +1406,12 @@ def main() -> None:
         os.replace(
             temporary_output_path,
             output_path,
+        )
+
+        # 정상 완료됐으므로 체크포인트는 더 이상 필요 없다.
+        cleanup_checkpoint(
+            checkpoint_xlsx_path,
+            checkpoint_json_path,
         )
 
     except Exception:
