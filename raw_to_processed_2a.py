@@ -22,6 +22,7 @@ import argparse
 import json
 import os
 import re
+import socket
 import time
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -40,6 +41,17 @@ ENV_OUTPUT_DIR = "LOCAL_CAMPAIGN_OUTPUT_DIR"
 # 워크북 + 진행 상태를 주기적으로 저장하고, 재실행 시 그 지점부터
 # 이어서 처리한다 (처음부터 다시 돌리지 않기 위함).
 CHECKPOINT_INTERVAL_SECONDS = 180.0
+
+# 절전모드 해제 직후 Wi-Fi가 아직 재연결되지 않은 상태에서
+# yt-dlp/gallery-dl DNS resolve가 통째로 실패하는 것을 막기 위한
+# 네트워크 준비 확인 설정 (실제 사례: resume 후 1~3초 만에 재실행되어
+# www.youtube.com / www.instagram.com resolve가 전부 실패).
+NETWORK_READY_CHECK_HOSTS = (
+    "www.youtube.com",
+    "www.instagram.com",
+)
+NETWORK_READY_MAX_WAIT_SECONDS = 30.0
+NETWORK_READY_POLL_INTERVAL_SECONDS = 2.0
 
 RAW_SHEET_NAMES = (
     "Raw Data_원문",
@@ -1248,6 +1260,62 @@ def cleanup_checkpoint(
     ):
         if path.exists():
             path.unlink()
+
+
+def wait_for_network_ready(
+    hosts: tuple[str, ...] = NETWORK_READY_CHECK_HOSTS,
+    max_wait_seconds: float = NETWORK_READY_MAX_WAIT_SECONDS,
+    poll_interval_seconds: float = NETWORK_READY_POLL_INTERVAL_SECONDS,
+) -> None:
+    """
+    media/comment 추출을 시작하기 전 네트워크(DNS)가 준비됐는지 확인한다.
+
+    노트북이 절전모드에서 깨어난 직후 곧바로 이 스크립트가 실행되면
+    Wi-Fi가 아직 재연결(재인증 + DHCP + DNS)되지 않아 yt-dlp/gallery-dl의
+    모든 호출이 getaddrinfo 실패로 죽는 사례가 확인됐다. hosts 중 하나라도
+    resolve에 성공하면 즉시 진행하고, max_wait_seconds 안에 전부 실패하면
+    경고만 남기고 계속 진행한다 (DNS가 근본적으로 막힌 경우까지 무한
+    대기시키지 않기 위함).
+    """
+
+    started_at = time.monotonic()
+    attempt = 0
+
+    while True:
+        attempt += 1
+
+        for host in hosts:
+            try:
+                socket.getaddrinfo(host, 443)
+            except OSError:
+                continue
+
+            if attempt > 1:
+                print(
+                    "[INFO] 네트워크 연결 확인됨 "
+                    f"({host}, {attempt}번째 시도, "
+                    f"{time.monotonic() - started_at:.1f}초 대기 후)"
+                )
+
+            return
+
+        elapsed = time.monotonic() - started_at
+
+        if elapsed >= max_wait_seconds:
+            print(
+                "[WARNING] 네트워크 준비 확인 시간 초과 "
+                f"({max_wait_seconds:.0f}초 이내 "
+                f"{', '.join(hosts)} resolve 전부 실패) - "
+                "네트워크가 아직 불안정할 수 있으나 계속 진행합니다."
+            )
+            return
+
+        print(
+            "[INFO] 네트워크가 아직 준비되지 않은 것으로 보입니다 "
+            f"(시도 {attempt}회, {elapsed:.1f}초 경과) - "
+            f"{poll_interval_seconds:.0f}초 후 재시도..."
+        )
+        time.sleep(poll_interval_seconds)
 
 
 def main() -> None:
