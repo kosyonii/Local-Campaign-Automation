@@ -376,12 +376,16 @@ def _extract_with_ytdlp(
 
     # 실제로 필요한 건 작성자 본인이 아닌 댓글 1개뿐이지만
     # (_first_non_self_ytdlp_comment가 첫 매치에서 멈춘다),
-    # 실측 결과 max_comments를 50->5로 줄여도 호출 소요시간에
-    # 유의미한 차이가 없었다 (병목이 댓글 페이지 개수가 아니라
-    # yt-dlp가 영상당 거치는 기본 요청들의 네트워크 왕복이었음).
-    # 대신 맨 위 댓글들이 전부 작성자 고정 댓글인 경우 결과를
-    # 못 찾을 위험만 커지므로 50개를 유지한다.
-    # 첫 50개 top-level 댓글만 조회한다.
+    # 맨 위 댓글들이 전부 작성자 고정 댓글인 경우 결과를
+    # 못 찾을 위험이 있어 50개를 유지한다.
+    # 첫 50개 top-level 댓글만 조회한다(답글 제외).
+    #
+    # 주의: Python API에서는 yt-dlp가 쉼표를 나눠주지 않으므로
+    # "50,50,0,0,1" 한 문자열로 넘기면 int 변환에 실패해 제한이
+    # 통째로 무시된다(영상당 댓글 수천 개를 전부 받아 건당 30~70초,
+    # 요청 수 증가로 403 노출도 커짐). 값을 리스트 원소로 나눠 넘긴다.
+    # 순서: max_comments, max_parents, max_replies,
+    #       max_replies_per_thread, max_depth
     if platform == "YT":
         options["extractor_args"] = {
             "youtube": {
@@ -389,7 +393,7 @@ def _extract_with_ytdlp(
                     "top"
                 ],
                 "max_comments": [
-                    "50,50,0,0,1"
+                    "50", "50", "0", "0", "1"
                 ],
             }
         }
