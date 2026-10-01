@@ -32,7 +32,7 @@ run_pipeline.py
     └─ output/Buzz_Volume/completed에 최종 결과 저장
 ```
 
-정상 운영 시 1~4단계는 `run_pipeline.py`로 실행합니다. 개별 모듈 명령어는 특정 단계에서 오류가 발생했거나, 이미 만들어진 실행 차수 폴더에서 해당 단계만 다시 실행할 때 사용합니다.
+정상 운영 시 1~4단계는 Streamlit 화면의 `Full Pipeline` 탭으로 실행합니다(`run_pipeline.py`를 내부에서 호출). 개별 모듈 명령어는 특정 단계에서 오류가 발생했거나, 이미 만들어진 실행 차수 폴더에서 해당 단계만 다시 실행할 때 사용합니다.
 
 ### 반드시 확인해야 하는 운영 규칙
 
@@ -128,19 +128,21 @@ Buzz Volume 모듈은 1~4단계가 완료된 직후 자동 실행되지 않습�
 
 ### 3.1 전체 파이프라인 실행 — 기본 권장 방식
 
-프로젝트 루트에서 다음 명령어를 실행합니다.
+> **주의:** 현재 `run_pipeline.py`는 단독 실행 파일이 아니라 Streamlit 화면이 불러 쓰는 모듈입니다. `python run_pipeline.py`로는 아무것도 실행되지 않습니다. 아래 Streamlit 화면으로 실행합니다. (`누락` 폴더 안의 `run_pipeline.py`는 별도로 단독 실행됩니다. 3.3 및 누락건 절 참고)
+
+프로젝트 루트에서 다음 명령어로 Streamlit 화면을 띄웁니다.
 
 ```powershell
-python run_pipeline.py
+uv run streamlit run streamlit_app.py
 ```
 
-`uv`를 사용하는 경우:
+`pip`/가상환경 방식인 경우:
 
 ```powershell
-uv run python run_pipeline.py
+python -m streamlit run streamlit_app.py
 ```
 
-실행 시 다음 두 값을 한 번씩 입력합니다.
+브라우저가 `http://localhost:8501`로 열리면 `Full Pipeline` 탭에서 다음 두 값을 한 번씩 입력합니다.
 
 ```text
 조회 시작 시각: YYYY-MM-DD HH:MM:SS
@@ -617,7 +619,7 @@ uv pip install -r requirements.txt
 가상환경을 활성화하지 않고 실행하려면:
 
 ```powershell
-uv run python run_pipeline.py
+uv run streamlit run streamlit_app.py
 ```
 
 ### 6.3 requirements.txt
@@ -1479,14 +1481,10 @@ gcloud auth application-default login
 ### Step 3. 전체 파이프라인 1~4단계 실행
 
 ```powershell
-python run_pipeline.py
+uv run streamlit run streamlit_app.py
 ```
 
-`uv`를 사용하는 경우:
-
-```powershell
-uv run python run_pipeline.py
-```
+브라우저의 `Full Pipeline` 탭에서 실행합니다.
 
 입력 예시:
 

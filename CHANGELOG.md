@@ -3,6 +3,13 @@
 
 ## 2026-10-01
 
+### 팀원용 설치·실행 가이드 추가 및 README 실행 안내 정정
+
+- `SETUP_GUIDE.md` 신규: 각자 PC(PowerShell/VS Code)에서 설치 → `.env` → gcloud/Edge 로그인 → Streamlit 실행 → 끊겼을 때 이어서 실행 → 업데이트 순서 안내
+- 확인된 사실: 현재 `run_pipeline.py`는 `__main__` 진입점이 없는 모듈(과거 커밋 8b6feab에서 제거)이라 `python run_pipeline.py`로는 아무것도 실행되지 않음. README 3.1·일일 실행 예시를 `streamlit run streamlit_app.py` 안내로 수정(`누락` 폴더의 `run_pipeline.py`는 단독 실행되므로 그대로)
+- `requirements.txt`에는 `pillow`, `streamlit`, `google-cloud-bigquery`가 빠져 있음(`pyproject.toml`에는 있음). 가이드는 `uv sync`를 권장하고 pip 사용 시 별도 설치를 안내. `requirements.txt` 자체는 수정하지 않음
+- 가이드의 새 PC 처음부터 설치는 실제로 따라 해 보지 않음
+
 ### 파이프라인 전체 체크포인트(중간 저장) 확대: 1·3·4단계 추가 (2a·2b는 기존)
 
 - 공용 `checkpoint_utils.py`: 임시 파일에 쓴 뒤 `os.replace`로 원자적 교체, 입력 fingerprint(수정 시각+크기) 불일치 시 체크포인트 무시, 3분 간격 저장기(`PeriodicCheckpoint`)
