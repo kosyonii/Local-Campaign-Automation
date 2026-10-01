@@ -1,6 +1,17 @@
 # 수정 로그
 # written automatically by claude / revised & reviewed by Seoyeon Ko
 
+## 2026-10-01
+
+### case1/case2 BEFORE·AFTER 단계별 소요시간 CSV 정리 + 추가 단축 후보 검토 (코드 변경 없음)
+
+- `case_timing_comparison.csv`: case1(4차/7차, 5차 참고)·case2(1차/2차)의 단계별 시간과 2b 채널별 댓글 추출 상세. case1 BEFORE 2단계(4,428.7초)는 `module_timings.csv`가 없어 CHANGELOG 기록값, case2 BEFORE 2단계(5,312초)는 재부팅 중단으로 두 구간 합산 추정값. 댓글 추출 시간은 호출별 합계라 병렬 실행의 wall time이 아님
+- 4단계 처리 방식: `llm_input` 시트의 게시물 1행 = Gemini 호출 1회, `ThreadPoolExecutor` 10워커(`GEMINI_MAX_WORKERS`), 재시도 3회, 요청 타임아웃 없음, thinking 설정 없음
+- **4단계와 3단계/2b 의존성(코드 확인, 실행 검증은 안 함)**: 4단계 (A) Gemini 호출은 `campaign_media_result.xlsx`(3단계 결과)만 읽고 소비자 댓글 URL은 버림 → 2b와 무관. (B) `map_and_write_formatted_excel`은 2b가 덮어쓴 formatted 엑셀의 댓글 URL을 읽어 같은 파일에 쓰므로 2b 완료 필요. (A)를 3단계 직후 시작하면 추정 절감 case2 약 2,000초, case1 약 1,500초(추정, 4단계 전체를 (A)로 가정)
+- **메모리 주의**: PC 15.6GB 중 Edge/VS Code가 약 7GB. case1 5차는 여유 5GB대에서 강제 종료됐고, 완주한 AFTER 측정의 최소 여유도 5.3~5.6GB. 4단계 (A)는 미디어를 inline bytes로 올리므로(게시물당 상한 450MB × 10워커) 2b·3단계와 겹치면 위험. 겹치기 전에 4단계 구간 실제 메모리와 미디어 용량 분포를 확인하고, 겹칠 때는 워커 수를 낮추는 것을 검토
+- 기타 후보(미시도): 4단계 요청 타임아웃, thinking 수준 낮추기(품질 비교 필요), 워커 수 증가(429 주의), 2b의 X/FB 병렬화, TT는 항상 0건인데 건당 약 26초 소요
+- 남은 일: 4단계 (A)/(B) 분리 및 3단계 직후 시작 구현 여부 결정
+
 ## 2026-09-30
 
 ### case2 AFTER 측정 (260913, 실행 폴더 `output/260913_2차`) — 중단 없이 완주, 합계 6,584.4초(109.7분)
