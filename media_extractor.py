@@ -1381,7 +1381,11 @@ def prepare_campaign_input_for_processing(
                 )
             continue
 
-        if normalized_media_types:
+        if len(source_urls) == 1 and len(normalized_media_types) > 1:
+            # Sprinklr가 carousel 내부 asset 타입을 한 셀에 줄바꿈으로 모두
+            # 기록한 경우. URL 1개 = Type 1개가 되도록 carousel로 통일한다.
+            prepared_df.at[row_index, "media_type"] = MediaType.CAROUSEL.value
+        elif normalized_media_types:
             prepared_df.at[row_index, "media_type"] = "\n".join(normalized_media_types)
         else:
             prepared_df.at[row_index, "media_type"] = MediaType.UNKNOWN.value
@@ -1426,6 +1430,22 @@ def normalize_source_medias(
         else:
             media_types = media_types * len(source_urls)
 
+    elif (
+        len(media_types) == 1
+        and len(source_urls) == 1
+        and media_types[0] == MediaType.CAROUSEL
+    ):
+        # carousel은 게시글 전체 타입이므로 개별 asset 타입은 다운로드 후 확정
+        media_types = (MediaType.UNKNOWN,)
+
+    elif len(media_types) > len(source_urls):
+        # Sprinklr가 carousel 내부 asset 타입은 전부 기록했지만 URL은 일부만
+        # 준 경우. 줄 위치로 URL과 타입을 짝지을 수 없으므로 타입은 UNKNOWN으로
+        # 두고, 다운로드 시 실제 응답의 타입으로 확정한다.
+        media_types = (
+            MediaType.UNKNOWN,
+        ) * len(source_urls)
+
     elif len(media_types) != len(source_urls):
         raise ValueError(
             "Media URL 개수와 Media Type 개수가 일치하지 않습니다. "
@@ -1449,13 +1469,21 @@ def identify_post_media_type(
     source_medias: tuple[SourceMedia, ...],
     raw_media_type_value: Any,
 ) -> MediaType:
-    if len(source_medias) > 1:
+    raw_types = normalize_cell_values(raw_media_type_value)
+
+    # URL은 1개뿐이어도 raw Type이 여러 개면 carousel 게시글이다.
+    if len(source_medias) > 1 or (source_medias and len(raw_types) > 1):
+        return MediaType.CAROUSEL
+
+    if any(
+        identify_media_type(value) == MediaType.CAROUSEL
+        for value in raw_types
+    ):
         return MediaType.CAROUSEL
 
     if len(source_medias) == 1:
         return source_medias[0].media_type
 
-    raw_types = normalize_cell_values(raw_media_type_value)
     if len(raw_types) == 1:
         return identify_media_type(raw_types[0])
 
@@ -3288,10 +3316,18 @@ def derive_post_media_type(
     if len(successful_types) > 1:
         return MediaType.CAROUSEL.value
 
+    fallback_types = normalize_cell_values(fallback_value)
+
+    # raw에서 carousel로 확인된 게시글은 내려받은 asset이 1개여도 carousel 유지
+    if any(
+        identify_media_type(value) == MediaType.CAROUSEL
+        for value in fallback_types
+    ):
+        return MediaType.CAROUSEL.value
+
     if len(successful_types) == 1:
         return successful_types[0]
 
-    fallback_types = normalize_cell_values(fallback_value)
     if len(fallback_types) == 1:
         return identify_media_type(fallback_types[0]).value
 

@@ -3,6 +3,15 @@
 
 ## 2026-10-01
 
+### media_extractor: Media Type 개수 > Media URL 개수 행 처리 (Row 76 ValueError 대응)
+
+- 원인: Sprinklr가 carousel 내부 asset 타입은 전부 줄바꿈으로 기록했지만 URL은 일부만 준 행에서 `normalize_source_medias`가 개수 불일치로 ValueError
+- `normalize_source_medias`: Type > URL이면 오류 대신 URL별 타입을 UNKNOWN으로 두고, 다운로드 시 실제 응답 타입으로 확정(기존 2949·3096줄 동작). 위치 대응이 불가능해 타입을 임의로 짝짓지 않음
+- `identify_post_media_type`: URL이 있고 raw Type이 2개 이상이면 게시글 타입을 CAROUSEL로 유지(URL이 1개여도)
+- `prepare_campaign_input_for_processing`: URL 1개 + Type 여러 개이면 출력 시트의 Media Type 셀을 `carousel` 1개로 통일(URL 1개 = Type 1개). `normalize_source_medias`는 URL 1개 + `carousel` 1개일 때 asset 타입을 UNKNOWN으로 두고 다운로드 후 확정. `identify_post_media_type`은 raw Type에 carousel이 있으면 CAROUSEL 반환
+- `derive_post_media_type`: raw Type이 carousel이면 다운로드 성공 asset이 1개여도 최종 post_media_type을 carousel로 유지(URL 1개 + Type 여러 개 행 대응). 성공 asset 2개 이상이면 종류와 무관하게 carousel인 기존 규칙은 그대로
+- 검증: 260927 데이터(2026-09-21 00:00 ~ 09-27 23:59:59, `output/260927`)를 새로 추출해 451행 확인. 이 데이터에는 Type > URL 행이 없어 Row 76은 재현 못 함. 합성 입력으로만 동작 확인(실제 데이터 미검증)
+
 ### case1/case2 BEFORE·AFTER 단계별 소요시간 CSV 정리 + 추가 단축 후보 검토 (코드 변경 없음)
 
 - `case_timing_comparison.csv`: case1(4차/7차, 5차 참고)·case2(1차/2차)의 단계별 시간과 2b 채널별 댓글 추출 상세. case1 BEFORE 2단계(4,428.7초)는 `module_timings.csv`가 없어 CHANGELOG 기록값, case2 BEFORE 2단계(5,312초)는 재부팅 중단으로 두 구간 합산 추정값. 댓글 추출 시간은 호출별 합계라 병렬 실행의 wall time이 아님
