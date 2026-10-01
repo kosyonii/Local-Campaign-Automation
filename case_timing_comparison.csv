@@ -1,0 +1,59 @@
+case	condition	run_folder	stage	item	seconds	minutes	note
+case1	BEFORE	260920_4차	1단계	sprinklr_export_excel			시간 기록 없음(raw 재사용)
+case1	BEFORE	260920_4차	2단계	raw_to_processed (2a+2b 통합)	4428.7	73.8	"559303b 기준 순수 BEFORE, 순차 실행(module_timings 없음, CHANGELOG 기록값)"
+case1	BEFORE	260920_4차	3단계	media_extractor	1925.128	32.1	"module_timings.csv, 순차 실행"
+case1	BEFORE	260920_4차	4단계	llm_analysis_pipeline	960.638	16	module_timings.csv
+case1	BEFORE	260920_4차	합계	전체(2+3+4단계)	7314.4	121.9	"2단계 4,428.7+3단계 1,925.1+4단계 960.6"
+case1	BEFORE	(참고)YT병렬만 적용	2단계	raw_to_processed	2740.7	45.7	"중간 시도, 합계 5,626.4초"
+case1	AFTER	260920_7차	2a	raw_to_processed	1.825	0	module_timings.csv
+case1	AFTER	260920_7차	3단계	media_extractor	408.816	6.8	2b와 동시 실행
+case1	AFTER	260920_7차	2b	consumer_reaction_url	1927.62	32.1	"3단계와 동시 실행, 2b·3 wall=1,927.6초"
+case1	AFTER	260920_7차	4단계	llm_analysis_pipeline	2159.861	36	"Gemini 응답 대기 지연(5차는 1,012초)"
+case1	AFTER	260920_7차	합계	전체(2a+2b·3 wall+4단계)	4089.3	68.2	"중단·재개 없음, BEFORE 대비 약 44% 단축"
+case1	AFTER	260920_5차(참고)	2a	raw_to_processed	2.047	0	module_timings.csv
+case1	AFTER	260920_5차(참고)	3단계	media_extractor	398.141	6.6	2b와 동시 실행
+case1	AFTER	260920_5차(참고)	2b	consumer_reaction_url 재개구간	1021.109	17	메모리 부족 강제종료 후 체크포인트 재개 구간
+case1	AFTER	260920_5차(참고)	2b	consumer_reaction_url 앞구간	1241	20.7	약값(18:55~19:15:47)
+case1	AFTER	260920_5차(참고)	4단계	llm_analysis_pipeline	1012.163	16.9	
+case1	AFTER	260920_5차(참고)	합계	전체	3276	54.6	"잠정치(2b·3 wall 약 2,262초), YT 추출 11/92로 품질 회귀"
+case2	BEFORE	260913_1차	1단계	sprinklr_export_excel	38.567	0.6	module_timings.csv
+case2	BEFORE	260913_1차	2단계	raw_to_processed (2a+2b 통합)	5312	88.5	"앞구간 약 3,285초(재부팅 중단 전 추정)+재개구간 2,027.3초, 추정범위 5,312~5,434"
+case2	BEFORE	260913_1차	2단계-재개구간	raw_to_processed	2027.264	33.8	"module_timings.csv, 체크포인트 483행부터"
+case2	BEFORE	260913_1차	3단계	media_extractor	2134.039	35.6	순차 실행
+case2	BEFORE	260913_1차	4단계	llm_analysis_pipeline	1750.203	29.2	
+case2	BEFORE	260913_1차	합계	"전체(2+3+4단계, 1단계 제외)"	9235	153.9	"상한 기준 약 9,357초, 1단계 포함 시 +38.6초"
+case2	AFTER	260913_2차	2a	raw_to_processed	3.544	0.1	module_timings.csv
+case2	AFTER	260913_2차	3단계	media_extractor	1236.458	20.6	2b와 동시 실행
+case2	AFTER	260913_2차	2b	consumer_reaction_url	3205.251	53.4	"3단계와 동시 실행, 2b·3 wall=3,205.3초"
+case2	AFTER	260913_2차	4단계	llm_analysis_pipeline	3375.602	56.3	"Gemini 응답 지연 추정, 분당 17.7건"
+case2	AFTER	260913_2차	합계	전체(2a+2b·3 wall+4단계)	6584.4	109.7	"중단·재개 없음, BEFORE 대비 약 29% 단축"
+case1	BEFORE	260920_4차	2b-댓글URL추출	FB: 21건/성공 18/오류 0	229	3.8	"합산 호출시간(병렬이라 wall 아님), 건당 평균 10.9초. "
+case1	BEFORE	260920_4차	2b-댓글URL추출	IG: 277건/성공 222/오류 11	526.7	8.8	"합산 호출시간(병렬이라 wall 아님), 건당 평균 1.9초. "
+case1	BEFORE	260920_4차	2b-댓글URL추출	TT: 2건/성공 0/오류 0	52.1	0.9	"합산 호출시간(병렬이라 wall 아님), 건당 평균 26.0초. "
+case1	BEFORE	260920_4차	2b-댓글URL추출	X: 217건/성공 170/오류 0	1513.1	25.2	"합산 호출시간(병렬이라 wall 아님), 건당 평균 7.0초. "
+case1	BEFORE	260920_4차	2b-댓글URL추출	YT: 92건/성공 68/오류 3	2478.8	41.3	"합산 호출시간(병렬이라 wall 아님), 건당 평균 26.9초. "
+case1	BEFORE	260920_4차	2b-댓글URL추출	전체: 609건/성공 478/오류 14	4799.6	80	합산 호출시간. 
+case1	AFTER	260920_7차	2b-댓글URL추출	FB: 21건/성공 18/오류 0	241.7	4	"합산 호출시간(병렬이라 wall 아님), 건당 평균 11.5초. "
+case1	AFTER	260920_7차	2b-댓글URL추출	IG: 277건/성공 221/오류 12	606.8	10.1	"합산 호출시간(병렬이라 wall 아님), 건당 평균 2.2초. "
+case1	AFTER	260920_7차	2b-댓글URL추출	TT: 2건/성공 0/오류 0	56.7	0.9	"합산 호출시간(병렬이라 wall 아님), 건당 평균 28.3초. "
+case1	AFTER	260920_7차	2b-댓글URL추출	X: 217건/성공 187/오류 0	1456.3	24.3	"합산 호출시간(병렬이라 wall 아님), 건당 평균 6.7초. "
+case1	AFTER	260920_7차	2b-댓글URL추출	YT: 92건/성공 68/오류 3	673.7	11.2	"합산 호출시간(병렬이라 wall 아님), 건당 평균 7.3초. "
+case1	AFTER	260920_7차	2b-댓글URL추출	전체: 609건/성공 494/오류 15	3035.1	50.6	합산 호출시간. 
+case1	AFTER	260920_5차(참고)	2b-댓글URL추출	FB: 21건/성공 18/오류 0	237	4	"합산 호출시간(병렬이라 wall 아님), 건당 평균 11.3초. 재개구간 기록만"
+case1	AFTER	260920_5차(참고)	2b-댓글URL추출	IG: 228건/성공 171/오류 13	478.2	8	"합산 호출시간(병렬이라 wall 아님), 건당 평균 2.1초. 재개구간 기록만"
+case1	AFTER	260920_5차(참고)	2b-댓글URL추출	TT: 2건/성공 0/오류 0	58.8	1	"합산 호출시간(병렬이라 wall 아님), 건당 평균 29.4초. 재개구간 기록만"
+case1	AFTER	260920_5차(참고)	2b-댓글URL추출	X: 94건/성공 80/오류 0	611.2	10.2	"합산 호출시간(병렬이라 wall 아님), 건당 평균 6.5초. 재개구간 기록만"
+case1	AFTER	260920_5차(참고)	2b-댓글URL추출	YT: 33건/성공 4/오류 16	374.5	6.2	"합산 호출시간(병렬이라 wall 아님), 건당 평균 11.3초. 재개구간 기록만"
+case1	AFTER	260920_5차(참고)	2b-댓글URL추출	전체: 378건/성공 273/오류 29	1759.6	29.3	합산 호출시간. 재개구간 기록만
+case2	BEFORE	260913_1차	2b-댓글URL추출	FB: 50건/성공 28/오류 0	548.8	9.1	"합산 호출시간(병렬이라 wall 아님), 건당 평균 11.0초. 재부팅 후 재개구간 416건만 기록"
+case2	BEFORE	260913_1차	2b-댓글URL추출	IG: 245건/성공 192/오류 19	430.8	7.2	"합산 호출시간(병렬이라 wall 아님), 건당 평균 1.8초. 재부팅 후 재개구간 416건만 기록"
+case2	BEFORE	260913_1차	2b-댓글URL추출	TT: 14건/성공 0/오류 0	370.3	6.2	"합산 호출시간(병렬이라 wall 아님), 건당 평균 26.4초. 재부팅 후 재개구간 416건만 기록"
+case2	BEFORE	260913_1차	2b-댓글URL추출	X: 89건/성공 74/오류 0	596.7	9.9	"합산 호출시간(병렬이라 wall 아님), 건당 평균 6.7초. 재부팅 후 재개구간 416건만 기록"
+case2	BEFORE	260913_1차	2b-댓글URL추출	YT: 18건/성공 0/오류 3	68.7	1.1	"합산 호출시간(병렬이라 wall 아님), 건당 평균 3.8초. 재부팅 후 재개구간 416건만 기록"
+case2	BEFORE	260913_1차	2b-댓글URL추출	전체: 416건/성공 294/오류 22	2015.3	33.6	합산 호출시간. 재부팅 후 재개구간 416건만 기록
+case2	AFTER	260913_2차	2b-댓글URL추출	FB: 50건/성공 27/오류 0	587.5	9.8	"합산 호출시간(병렬이라 wall 아님), 건당 평균 11.7초. 전체 888건"
+case2	AFTER	260913_2차	2b-댓글URL추출	IG: 341건/성공 284/오류 24	822.1	13.7	"합산 호출시간(병렬이라 wall 아님), 건당 평균 2.4초. 전체 888건"
+case2	AFTER	260913_2차	2b-댓글URL추출	TT: 14건/성공 0/오류 0	373.1	6.2	"합산 호출시간(병렬이라 wall 아님), 건당 평균 26.6초. 전체 888건"
+case2	AFTER	260913_2차	2b-댓글URL추출	X: 268건/성공 212/오류 0	1864	31.1	"합산 호출시간(병렬이라 wall 아님), 건당 평균 7.0초. 전체 888건"
+case2	AFTER	260913_2차	2b-댓글URL추출	YT: 215건/성공 158/오류 1	1776.8	29.6	"합산 호출시간(병렬이라 wall 아님), 건당 평균 8.3초. 전체 888건"
+case2	AFTER	260913_2차	2b-댓글URL추출	전체: 888건/성공 681/오류 25	5423.4	90.4	합산 호출시간. 전체 888건
