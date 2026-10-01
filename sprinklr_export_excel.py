@@ -25,6 +25,11 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 from dotenv import load_dotenv
 
 import sprinklr_rate_limiter
+from checkpoint_utils import (
+    PeriodicCheckpoint,
+    checkpoint_json_path,
+    load_checkpoint_json,
+)
 
 CODE_VERSION = "20260903_ROOT_HASMORE_HEADINGS_ONLY_V3"
 print(f"[SPRINKLR EXPORT LOADED] {CODE_VERSION}")
@@ -436,6 +441,7 @@ def create_empty_workbook() -> Workbook:
 def prepare_output_artifacts(
     output_excel_path: Path,
     overwrite: bool,
+    keep_existing_temporary: bool = False,
 ) -> tuple[Path, Path, Path]:
     """
     최종 파일을 바로 수정하지 않고 임시 산출물 경로를 준비한다.
@@ -468,6 +474,14 @@ def prepare_output_artifacts(
         output_excel_path.parent
         / "sprinklr_response_samples"
     )
+
+    # 체크포인트에서 이어서 처리할 때는 이전 실행이 남긴 응답 샘플을 유지한다.
+    if keep_existing_temporary and temporary_response_dir.is_dir():
+        return (
+            temporary_excel_path,
+            temporary_response_dir,
+            final_response_dir,
+        )
 
     # 이전 실패 실행에서 남은 임시 산출물만 정리한다.
     if temporary_excel_path.exists():
@@ -2774,6 +2788,29 @@ def main() -> None:
         f"{naming_month}월_v01.xlsx"
     )
 
+    # 위젯 단위 체크포인트: 같은 조회 구간으로 다시 실행하면 이미 받아 둔
+    # 위젯은 건너뛰고 이어서 처리한다. fingerprint는 조회 구간(start/end)이다.
+    checkpoint_workbook_path = output_excel_path.with_name(
+        f".{output_excel_path.stem}.checkpoint.xlsx"
+    )
+    checkpoint = PeriodicCheckpoint(
+        path=checkpoint_json_path(output_excel_path, "sprinklr"),
+        fingerprint=f"{start_time_ms}|{end_time_ms}",
+    )
+    saved_checkpoint = load_checkpoint_json(
+        checkpoint.path,
+        checkpoint.fingerprint,
+    )
+
+    if saved_checkpoint is not None and not (
+        checkpoint_workbook_path.is_file()
+        and (
+            output_excel_path.parent
+            / ".sprinklr_response_samples.partial"
+        ).is_dir()
+    ):
+        saved_checkpoint = None
+
     (
         temporary_excel_path,
         temporary_response_dir,
@@ -2781,11 +2818,39 @@ def main() -> None:
     ) = prepare_output_artifacts(
         output_excel_path=output_excel_path,
         overwrite=args.overwrite,
+        keep_existing_temporary=saved_checkpoint is not None,
     )
 
-    # 기존 완성 파일을 열지 않고 항상 새 Workbook에서 시작한다.
-    # 따라서 동일 데이터 컷이 기존 행 아래에 중복 추가되지 않는다.
-    workbook = create_empty_workbook()
+    completed_widget_names: list[str] = []
+
+    if saved_checkpoint is not None:
+        # 체크포인트 워크북에서 이어서 시작한다.
+        workbook = load_workbook(checkpoint_workbook_path)
+        completed_widget_names = list(
+            saved_checkpoint["completed_widgets"]
+        )
+        print(
+            "[CHECKPOINT] 이전 실행의 중간 저장에서 이어서 처리합니다. "
+            f"완료된 위젯 {len(completed_widget_names)}개: "
+            f"{completed_widget_names}"
+        )
+    else:
+        # 기존 완성 파일을 열지 않고 항상 새 Workbook에서 시작한다.
+        # 따라서 동일 데이터 컷이 기존 행 아래에 중복 추가되지 않는다.
+        workbook = create_empty_workbook()
+
+    def save_widget_checkpoint() -> None:
+        def _build_state() -> dict[str, Any]:
+            temp_path = checkpoint_workbook_path.with_name(
+                checkpoint_workbook_path.name + ".tmp"
+            )
+            workbook.save(temp_path)
+            os.replace(temp_path, checkpoint_workbook_path)
+
+            return {"completed_widgets": list(completed_widget_names)}
+
+        # 위젯 하나가 끝날 때마다 저장한다(위젯은 최대 12개).
+        checkpoint.maybe_save(_build_state, force=True)
 
     # 조회 결과가 0건이어도 Raw Data 시트가 반드시 존재하도록
     # 두 시트를 먼저 만들고 1행 헤더를 작성한다.
@@ -2815,10 +2880,19 @@ def main() -> None:
                     end_time_ms,
                 )
                 for widget_config in WIDGET_CONFIGS
+                if widget_config["widget_name"]
+                not in completed_widget_names
             }
 
             for widget_config in WIDGET_CONFIGS:
                 widget_name = widget_config["widget_name"]
+
+                if widget_name in completed_widget_names:
+                    print(
+                        "[CHECKPOINT] 이미 완료된 위젯을 건너뜁니다: "
+                        f"{widget_name}"
+                    )
+                    continue
 
                 try:
                     widget_result = widget_futures[widget_name].result()
@@ -2952,6 +3026,9 @@ def main() -> None:
                     df=df,
                     sheet_name=TARGET_SHEET_NAME
                 )
+
+                completed_widget_names.append(widget_name)
+                save_widget_checkpoint()
         finally:
             widget_executor.shutdown(
                 wait=True,
@@ -2999,11 +3076,25 @@ def main() -> None:
             final_response_dir=final_response_dir,
         )
 
+        # 정상 완료: 체크포인트는 더 이상 필요 없다.
+        checkpoint.cleanup()
+        if checkpoint_workbook_path.exists():
+            checkpoint_workbook_path.unlink()
+
     except Exception:
-        cleanup_temporary_artifacts(
-            temporary_excel_path=temporary_excel_path,
-            temporary_response_dir=temporary_response_dir,
-        )
+        # 체크포인트가 있으면 이미 받은 응답 샘플을 남겨 이어서 처리한다.
+        if checkpoint.path.is_file():
+            if temporary_excel_path.exists():
+                temporary_excel_path.unlink()
+            print(
+                "[CHECKPOINT] 중간 저장을 남겨 두었습니다. 같은 명령을 "
+                "다시 실행하면 이어서 처리합니다."
+            )
+        else:
+            cleanup_temporary_artifacts(
+                temporary_excel_path=temporary_excel_path,
+                temporary_response_dir=temporary_response_dir,
+            )
         raise
 
     print("Done.")

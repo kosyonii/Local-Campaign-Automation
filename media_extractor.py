@@ -9,7 +9,7 @@ import subprocess
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
@@ -18,6 +18,13 @@ from urllib.parse import parse_qs, urlparse
 
 import pandas as pd
 import requests
+
+from checkpoint_utils import (
+    PeriodicCheckpoint,
+    checkpoint_json_path,
+    load_checkpoint_json,
+    source_fingerprint,
+)
 
 
 # =========================================================
@@ -668,9 +675,13 @@ def prepare_temporary_artifacts(
     output_excel_path: Path,
     media_dir: Path,
     overwrite: bool,
+    keep_existing_temporary: bool = False,
 ) -> tuple[Path, Path, Path]:
     """
     기존 결과를 직접 수정하지 않고 임시 Excel과 임시 media 폴더를 준비한다.
+
+    keep_existing_temporary=True이면(체크포인트에서 이어서 처리) 이전 실행이
+    남긴 임시 media 폴더를 지우지 않고 그대로 사용한다.
 
     반환:
         temporary_excel_path
@@ -731,6 +742,13 @@ def prepare_temporary_artifacts(
     if temporary_excel_path.exists():
         temporary_excel_path.unlink()
 
+    if keep_existing_temporary and temporary_media_dir.is_dir():
+        return (
+            temporary_excel_path,
+            temporary_media_dir,
+            backup_media_dir,
+        )
+
     if temporary_media_dir.exists():
         shutil.rmtree(
             temporary_media_dir
@@ -746,6 +764,74 @@ def prepare_temporary_artifacts(
         temporary_media_dir,
         backup_media_dir,
     )
+
+
+# =========================================================
+# 3-1. Checkpoint (중간 저장 / 이어하기)
+# =========================================================
+
+MEDIA_CHECKPOINT_PHASES = (
+    "built",
+    "tiktok_done",
+    "gallery_dl_done",
+    "download_done",
+    "gallery_dl_fallback_done",
+    "download_fallback_done",
+)
+
+
+def media_assets_to_checkpoint(
+    media_assets: list[MediaAsset],
+) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+
+    for asset in list(media_assets):
+        record = asdict(asset)
+        record["platform"] = asset.platform.value
+        record["media_type"] = asset.media_type.value
+        record["input_media_type"] = asset.input_media_type.value
+        record["local_path"] = (
+            str(asset.local_path)
+            if asset.local_path is not None
+            else None
+        )
+        records.append(record)
+
+    return records
+
+
+def media_assets_from_checkpoint(
+    records: list[dict[str, Any]],
+) -> list[MediaAsset]:
+    assets: list[MediaAsset] = []
+
+    for record in records:
+        record = dict(record)
+        record["platform"] = Platform(record["platform"])
+        record["media_type"] = MediaType(record["media_type"])
+        record["input_media_type"] = MediaType(
+            record["input_media_type"]
+        )
+        local_path = record.get("local_path")
+        record["local_path"] = (
+            Path(local_path) if local_path else None
+        )
+        asset = MediaAsset(**record)
+
+        # 다운로드 완료로 기록됐지만 파일이 없으면 다시 받는다.
+        if (
+            asset.status == "downloaded"
+            and (
+                asset.local_path is None
+                or not asset.local_path.is_file()
+            )
+        ):
+            asset.status = "pending"
+            asset.local_path = None
+
+        assets.append(asset)
+
+    return assets
 
 
 def rebase_media_asset_local_paths(
@@ -2992,6 +3078,7 @@ def download_media_asset(
 def process_media_assets(
     media_assets: list[MediaAsset],
     local_media_root: Path,
+    on_progress=None,
 ) -> list[MediaAsset]:
     """
     status가 pending인 asset만 실제 검사 및 다운로드한다.
@@ -3133,6 +3220,9 @@ def process_media_assets(
                 f"[{progress_number}/{pending_asset_count}] "
                 f"처리 완료: {asset.asset_id} -> {asset.status}"
             )
+
+            if on_progress is not None:
+                on_progress()
 
         if pending_indexes:
             with ThreadPoolExecutor(
@@ -3719,6 +3809,16 @@ def main() -> None:
         output_dir=output_dir,
     )
 
+    # 이전 실행이 중간에 끊겼다면 체크포인트에서 이어서 처리한다.
+    checkpoint = PeriodicCheckpoint(
+        path=checkpoint_json_path(output_excel_path, "media"),
+        fingerprint=source_fingerprint(input_excel_path),
+    )
+    saved_checkpoint = load_checkpoint_json(
+        checkpoint.path,
+        checkpoint.fingerprint,
+    )
+
     (
         temporary_excel_path,
         temporary_media_dir,
@@ -3727,7 +3827,14 @@ def main() -> None:
         output_excel_path=output_excel_path,
         media_dir=media_dir,
         overwrite=args.overwrite,
+        keep_existing_temporary=saved_checkpoint is not None,
     )
+
+    if (
+        saved_checkpoint is not None
+        and not temporary_media_dir.is_dir()
+    ):
+        saved_checkpoint = None
 
     print(f"입력 파일: {input_excel_path}")
     print(f"출력 파일: {output_excel_path}")
@@ -3784,30 +3891,91 @@ def main() -> None:
             f"{len(media_assets)}개"
         )
 
+        completed_phase_index = -1
+
+        if saved_checkpoint is not None:
+            media_assets = media_assets_from_checkpoint(
+                saved_checkpoint["assets"]
+            )
+            completed_phase_index = MEDIA_CHECKPOINT_PHASES.index(
+                saved_checkpoint["phase"]
+            )
+            print(
+                "[CHECKPOINT] 이전 실행의 중간 저장에서 이어서 처리합니다. "
+                f"완료 단계={saved_checkpoint['phase']}, "
+                f"asset={len(media_assets)}개"
+            )
+
+        # 단계가 끝날 때마다 강제 저장하고, 오래 걸리는 다운로드 단계에서는
+        # 3분 간격으로 저장한다. 진행 중 단계는 직전 완료 단계로 기록해,
+        # 재개 시 그 단계를 다시 돌리되 이미 끝난 asset은 건너뛴다.
+        def phase_done(phase: str) -> bool:
+            return (
+                MEDIA_CHECKPOINT_PHASES.index(phase)
+                <= completed_phase_index
+            )
+
+        def save_phase(phase: str, assets: list[MediaAsset]) -> None:
+            checkpoint.maybe_save(
+                lambda: {
+                    "phase": phase,
+                    "assets": media_assets_to_checkpoint(assets),
+                },
+                force=True,
+            )
+
+        def periodic_saver(previous_phase: str, assets: list[MediaAsset]):
+            def _save() -> None:
+                checkpoint.maybe_save(
+                    lambda: {
+                        "phase": previous_phase,
+                        "assets": media_assets_to_checkpoint(assets),
+                    }
+                )
+
+            return _save
+
+        if not phase_done("built"):
+            save_phase("built", media_assets)
+
         # 5-1. TikTok 게시물 URL은 yt-dlp로 임시 media 폴더에 저장한다.
-        media_assets = process_tiktok_media_assets_with_yt_dlp(
-            media_assets=media_assets,
-            local_media_root=temporary_media_dir,
-        )
+        if not phase_done("tiktok_done"):
+            media_assets = process_tiktok_media_assets_with_yt_dlp(
+                media_assets=media_assets,
+                local_media_root=temporary_media_dir,
+            )
+            save_phase("tiktok_done", media_assets)
 
         # 5-2. Twitter LINK/UNKNOWN 게시물을 gallery-dl로 처리한다.
-        media_assets = resolve_page_media_assets_with_gallery_dl(
-            media_assets=media_assets,
-            only_failed_unknown=False,
-        )
+        if not phase_done("gallery_dl_done"):
+            media_assets = resolve_page_media_assets_with_gallery_dl(
+                media_assets=media_assets,
+                only_failed_unknown=False,
+            )
+            save_phase("gallery_dl_done", media_assets)
 
         # 6. 1차 URL feasibility 검사 및 직접 다운로드
-        processed_assets = process_media_assets(
-            media_assets=media_assets,
-            local_media_root=temporary_media_dir,
-        )
+        processed_assets = media_assets
+
+        if not phase_done("download_done"):
+            processed_assets = process_media_assets(
+                media_assets=media_assets,
+                local_media_root=temporary_media_dir,
+                on_progress=periodic_saver(
+                    "gallery_dl_done",
+                    media_assets,
+                ),
+            )
+            save_phase("download_done", processed_assets)
 
         # 6-1. TikTok을 제외하고 직접 URL 처리에 실패한 UNKNOWN 행은
         #      원본 게시물 URL을 gallery-dl에 다시 전달한다.
-        processed_assets = resolve_page_media_assets_with_gallery_dl(
-            media_assets=processed_assets,
-            only_failed_unknown=True,
-        )
+        if not phase_done("gallery_dl_fallback_done"):
+            processed_assets = resolve_page_media_assets_with_gallery_dl(
+                media_assets=processed_assets,
+                only_failed_unknown=True,
+            )
+            save_phase("gallery_dl_fallback_done", processed_assets)
 
         # 6-2. gallery-dl fallback으로 새 pending asset이 생성된 경우
         #      2차 다운로드를 실행한다.
@@ -3816,11 +3984,19 @@ def main() -> None:
             for asset in processed_assets
         )
 
-        if has_pending_assets:
+        if has_pending_assets and not phase_done(
+            "download_fallback_done"
+        ):
+            fallback_input_assets = processed_assets
             processed_assets = process_media_assets(
-                media_assets=processed_assets,
+                media_assets=fallback_input_assets,
                 local_media_root=temporary_media_dir,
+                on_progress=periodic_saver(
+                    "gallery_dl_fallback_done",
+                    fallback_input_assets,
+                ),
             )
+            save_phase("download_fallback_done", processed_assets)
 
         # 6-3. 자동 처리 실패 건은 사용자 수동 처리 대상으로 표시한다.
         processed_assets = mark_remaining_failures_for_manual_action(
@@ -3859,11 +4035,24 @@ def main() -> None:
             backup_media_dir=backup_media_dir,
         )
 
+        # 정상 완료: 체크포인트는 더 이상 필요 없다.
+        checkpoint.cleanup()
+
     except Exception:
-        cleanup_temporary_artifacts(
-            temporary_excel_path=temporary_excel_path,
-            temporary_media_dir=temporary_media_dir,
-        )
+        # 체크포인트가 있으면 다운로드한 임시 media 폴더를 남겨 이어서
+        # 처리할 수 있게 하고, 임시 Excel만 정리한다.
+        if checkpoint.path.is_file():
+            if temporary_excel_path.exists():
+                temporary_excel_path.unlink()
+            print(
+                "[CHECKPOINT] 중간 저장을 남겨 두었습니다. 같은 명령을 "
+                "다시 실행하면 이어서 처리합니다."
+            )
+        else:
+            cleanup_temporary_artifacts(
+                temporary_excel_path=temporary_excel_path,
+                temporary_media_dir=temporary_media_dir,
+            )
         raise
 
     if llm_input_df.empty:

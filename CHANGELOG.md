@@ -3,6 +3,14 @@
 
 ## 2026-10-01
 
+### 파이프라인 전체 체크포인트(중간 저장) 확대: 1·3·4단계 추가 (2a·2b는 기존)
+
+- 공용 `checkpoint_utils.py`: 임시 파일에 쓴 뒤 `os.replace`로 원자적 교체, 입력 fingerprint(수정 시각+크기) 불일치 시 체크포인트 무시, 3분 간격 저장기(`PeriodicCheckpoint`)
+- 1단계 `sprinklr_export_excel.py`: 위젯 하나가 끝날 때마다 워크북+완료 위젯 목록 저장(fingerprint=조회 start/end). 재실행 시 완료된 위젯은 호출하지 않고 이어서 처리, 응답 샘플 임시 폴더 유지. 한계: 위젯은 WIDGET_CONFIGS 순서대로 소비하므로 느린 위젯 뒤에 이미 받은 응답은 크래시 시 다시 받음
+- 3단계 `media_extractor.py`: 처리 단계(built, tiktok_done, gallery_dl_done, download_done, gallery_dl_fallback_done, download_fallback_done)와 asset 전체 상태를 저장하고, 다운로드 중에는 3분마다 저장. 실패 시 임시 media 폴더를 남기고 재실행하면 이어서 처리(받은 파일이 없으면 pending으로 되돌려 재다운로드). 한계: TikTok(yt-dlp)·gallery-dl 단계는 단계 종료 시점에만 저장
+- 4단계 `llm_analysis_pipeline.py`: 성공한 Gemini 결과를 3분마다 저장(fingerprint=입력 Excel+모델+프롬프트). 재실행 시 성공한 행은 호출하지 않고 복원, 실패 행만 재시도. 최종 Excel 저장 후 체크포인트 삭제
+- 검증(가짜 네트워크/Gemini, 실제 호출 없음): 1단계는 중간 크래시 후 재개한 결과가 원본 추출 결과와 완전히 동일(216/235행), 완료 위젯 11개 건너뛰고 1개만 재호출. 3단계는 5건 다운로드 후 크래시, 재개에서 나머지만 처리하고 체크포인트 정리. 4단계는 성공 10건 복원 후 90건만 호출, 입력 파일 변경 시 체크포인트 무시. 실제 Sprinklr·Gemini·다운로드로 끊김/재개를 검증하지는 않음
+
 ### media_extractor: Media Type 개수 > Media URL 개수 행 처리 (Row 76 ValueError 대응)
 
 - 원인: Sprinklr가 carousel 내부 asset 타입은 전부 줄바꿈으로 기록했지만 URL은 일부만 준 행에서 `normalize_source_medias`가 개수 불일치로 ValueError

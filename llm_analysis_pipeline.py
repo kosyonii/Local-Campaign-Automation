@@ -10,16 +10,26 @@ import re
 import sys
 import time
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
+import hashlib
+
 import pandas as pd
 from openpyxl import load_workbook
 from openpyxl.worksheet.worksheet import Worksheet
 from dotenv import load_dotenv
+
+from checkpoint_utils import (
+    PeriodicCheckpoint,
+    checkpoint_json_path,
+    load_checkpoint_json,
+    remove_checkpoint,
+    source_fingerprint,
+)
 
 
 # =========================================================
@@ -2989,6 +2999,26 @@ def write_call_result_to_dataframe(
         )
 
 
+def llm_checkpoint_path(result_excel_path: Path) -> Path:
+    return checkpoint_json_path(Path(result_excel_path), "llm")
+
+
+def llm_checkpoint_fingerprint(
+    result_excel_path: Path,
+    prompt_bundle: PromptBundle,
+) -> str:
+    """입력 Excel + 프롬프트/모델이 같을 때만 체크포인트를 재사용한다."""
+
+    prompt_digest = hashlib.sha256(
+        repr(prompt_bundle).encode("utf-8")
+    ).hexdigest()[:16]
+
+    return (
+        f"{source_fingerprint(Path(result_excel_path))}"
+        f"|{GEMINI_MODEL}|{prompt_digest}"
+    )
+
+
 def run_llm_pipeline(
     result_excel_path: Path,
     prompt_bundle: PromptBundle,
@@ -3019,6 +3049,39 @@ def run_llm_pipeline(
         client, types_module = create_genai_client()
 
     attempted_count = 0
+
+    # 성공한 Gemini 호출 결과를 3분마다 저장해 두고, 재실행하면 성공한
+    # 행은 다시 호출하지 않는다. 실패한 행은 재시도 대상이다.
+    # 정상 종료 후 정리는 최종 Excel 저장이 끝난 뒤 main()에서 한다.
+    checkpoint: PeriodicCheckpoint | None = None
+    completed_results: dict[int, dict[str, Any]] = {}
+    restored_results: dict[int, LLMCallResult] = {}
+
+    if client is not None and not dry_run:
+        checkpoint = PeriodicCheckpoint(
+            path=llm_checkpoint_path(result_excel_path),
+            fingerprint=llm_checkpoint_fingerprint(
+                result_excel_path,
+                prompt_bundle,
+            ),
+        )
+        saved_checkpoint = load_checkpoint_json(
+            checkpoint.path,
+            checkpoint.fingerprint,
+        )
+
+        if saved_checkpoint is not None:
+            for record in saved_checkpoint.get("results", []):
+                call_result = LLMCallResult(**record)
+                restored_results[call_result.dataframe_index] = (
+                    call_result
+                )
+                completed_results[call_result.dataframe_index] = record
+
+            print(
+                "[CHECKPOINT] 이전 실행의 중간 저장에서 이어서 처리합니다. "
+                f"완료된 Gemini 결과 {len(restored_results)}건 복원"
+            )
 
     try:
         total_rows = len(input_sets)
@@ -3086,6 +3149,18 @@ def run_llm_pipeline(
                     write_call_result_to_dataframe(
                         result_dataframe=result_dataframe,
                         call_result=call_result,
+                        output_columns=output_columns,
+                    )
+                    continue
+
+                restored_result = restored_results.get(
+                    input_set.dataframe_index
+                )
+
+                if restored_result is not None:
+                    write_call_result_to_dataframe(
+                        result_dataframe=result_dataframe,
+                        call_result=restored_result,
                         output_columns=output_columns,
                     )
                     continue
@@ -3164,9 +3239,29 @@ def run_llm_pipeline(
                     output_columns=output_columns,
                 )
 
+                if (
+                    checkpoint is not None
+                    and call_result.api_status == "success"
+                ):
+                    completed_results[call_result.dataframe_index] = (
+                        asdict(call_result)
+                    )
+                    checkpoint.maybe_save(
+                        lambda: {
+                            "results": list(completed_results.values())
+                        }
+                    )
+
         finally:
             if executor is not None:
                 executor.shutdown(wait=True)
+
+            # 중단되더라도 그때까지 성공한 결과는 남긴다.
+            if checkpoint is not None and completed_results:
+                checkpoint.maybe_save(
+                    lambda: {"results": list(completed_results.values())},
+                    force=True,
+                )
 
     finally:
         if client is not None:
@@ -5153,6 +5248,9 @@ def main() -> None:
             temporary_output_path=temporary_output_path,
             output_excel_path=output_excel_path,
         )
+
+        # 최종 결과가 저장됐으므로 Gemini 중간 저장은 더 이상 필요 없다.
+        remove_checkpoint(llm_checkpoint_path(input_excel_path))
 
     except Exception:
         cleanup_temporary_results(
