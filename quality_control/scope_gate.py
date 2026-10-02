@@ -17,6 +17,7 @@ DROP은 (1) 비모바일 용어 히트, (2) 모바일 신호 없음, (3) Gemini�
 
 from __future__ import annotations
 
+import html
 import json
 import re
 import sys
@@ -316,6 +317,112 @@ def reason_is_garbled(reason: str) -> bool:
     )
 
 
+_CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+_ELLIPSIS_RE = re.compile(r"\.{3}|…")
+
+# 같은 질의를 다시 불러도 되는 최대 횟수(깨진 응답, 검증 실패 인용)와,
+# DROP을 확정하려면 서로 일치해야 하는 호출 횟수.
+MAX_CLEAN_ATTEMPTS = 3
+DROP_CONSENSUS_CALLS = 2
+
+
+def _alnum_key(text: str) -> str:
+    """HTML 엔티티를 풀고 글자·숫자만 남긴 비교용 문자열(따옴표·대시·이모지·공백 무시)."""
+
+    normalized = unicodedata.normalize("NFKC", html.unescape(text)).casefold()
+
+    return "".join(c for c in normalized if unicodedata.category(c)[0] in "LN")
+
+
+def evidence_in_text(evidence: str, text: str, min_chars: int = 4) -> bool:
+    """Gemini가 인용한 근거가 원문에 실제로 있는지.
+
+    모델이 따옴표 종류를 바꾸거나(“ -> ‘), &lt; 같은 HTML 엔티티를 풀거나,
+    떨어진 두 구절을 '...'로 이어 붙여도 통과한다. 조각마다 따로 검증하고
+    모든 조각이 원문에 있어야 한다. 글자·숫자가 min_chars 미만인 조각은 근거로 쓰지 않는다.
+    """
+
+    fragments = [
+        f
+        for f in _ELLIPSIS_RE.split(evidence)
+        if len(_alnum_key(f)) >= min_chars
+    ]
+
+    if not fragments:
+        return False
+
+    key = _alnum_key(text)
+
+    return all(_alnum_key(f) in key for f in fragments)
+
+
+def response_is_clean(judgement: Judgement, query: ScopeQuery) -> bool:
+    """재호출 없이 쓸 수 있는 응답인지.
+
+    제어문자가 섞이거나 reason이 깨졌거나, 비모바일 전용이라면서 근거가 원문에 없으면
+    깨끗하지 않다. (비모바일 전용 외 판정의 근거는 쓰이지 않는다.)
+    """
+
+    if _CONTROL_CHAR_RE.search(judgement.evidence) or _CONTROL_CHAR_RE.search(
+        judgement.reason
+    ):
+        return False
+
+    if reason_is_garbled(judgement.reason):
+        return False
+
+    if judgement.verdict == VERDICT_NON_MOBILE:
+        return _evidence_is_verified(judgement, query.text)[0]
+
+    return True
+
+
+def make_stable_judge(
+    call: Judge,
+    attempts: int = MAX_CLEAN_ATTEMPTS,
+    consensus: int = DROP_CONSENSUS_CALLS,
+) -> Judge:
+    """한 번의 호출(call)을 일관성 있게 감싼다.
+
+    1. 깨끗하지 않은 응답은 최대 attempts번까지 다시 부른다. 끝까지 깨끗하지 않으면
+       마지막 응답을 그대로 돌려주고, 판정 규칙이 FLAG로 처리한다.
+    2. 비모바일 전용(DROP 후보)은 consensus번 모두 비모바일 전용이고 깨끗해야 확정한다.
+       하나라도 다르면 그 다른 응답을 돌려줘 FLAG가 되게 한다.
+    """
+
+    def obtain(query: ScopeQuery) -> Judgement:
+        latest: Judgement | None = None
+
+        for _ in range(max(1, attempts)):
+            latest = call(query)
+
+            if response_is_clean(latest, query):
+                return latest
+
+        assert latest is not None
+        return latest
+
+    def judge(query: ScopeQuery) -> Judgement:
+        first = obtain(query)
+
+        if first.verdict != VERDICT_NON_MOBILE or not response_is_clean(
+            first, query
+        ):
+            return first
+
+        for _ in range(max(1, consensus) - 1):
+            other = obtain(query)
+
+            if other.verdict != VERDICT_NON_MOBILE or not response_is_clean(
+                other, query
+            ):
+                return other
+
+        return first
+
+    return judge
+
+
 def build_user_message(query: ScopeQuery) -> str:
     matched = "; ".join(
         f"{family}: {', '.join(hits)}"
@@ -361,7 +468,7 @@ def build_gemini_judge(
         # 12/12 NON_MOBILE_ONLY가 된다. 누락률이 우선이라 기본값을 유지한다.
     )
 
-    def judge(query: ScopeQuery) -> Judgement:
+    def call(query: ScopeQuery) -> Judgement:
         last_exc: Exception | None = None
 
         for attempt in range(1, lap.MAX_RETRIES + 1):
@@ -376,15 +483,7 @@ def build_gemini_judge(
                 if not text:
                     raise ValueError("빈 응답")
 
-                judgement = Judgement.from_dict(json.loads(text))
-
-                # 깨진 reason은 재시도. 끝까지 깨지면 판정은 유효하므로 그대로 쓴다.
-                if reason_is_garbled(judgement.reason) and (
-                    attempt < lap.MAX_RETRIES
-                ):
-                    continue
-
-                return judgement
+                return Judgement.from_dict(json.loads(text))
             except Exception as exc:  # noqa: BLE001 - 재시도 여부를 아래서 판단
                 last_exc = exc
 
@@ -398,7 +497,7 @@ def build_gemini_judge(
         assert last_exc is not None
         raise last_exc
 
-    return judge
+    return make_stable_judge(call)
 
 
 def run_judgements(
@@ -508,12 +607,10 @@ def _describe_hits(hits: dict[str, list[str]]) -> str:
 def _evidence_is_verified(
     judgement: Judgement, full_text: str
 ) -> tuple[bool, str]:
-    evidence = normalize_for_containment(judgement.evidence)
-
-    if len(evidence) < 2:
+    if len(_alnum_key(judgement.evidence)) < 4:
         return False, "근거 인용이 비어 있음"
 
-    if evidence not in normalize_for_containment(full_text):
+    if not evidence_in_text(judgement.evidence, full_text):
         return False, "근거 인용이 원문에서 확인되지 않음"
 
     if not judgement.non_mobile_products:
