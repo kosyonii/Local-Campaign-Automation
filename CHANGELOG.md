@@ -15,6 +15,15 @@
 - 발견한 문제 ② 사전 경계 규칙 때문에 붙여 쓴 해시태그(`#GalaxyZFold8Ultra`, `#TeamGalaxy`)는 `mobile_strong`에 안 걸림. 행 190은 Gemini가 구해 FLAG가 됐지만 사전 단계에서는 보호받지 못함. Galaxy·갤럭시를 경계 없이 매칭하도록 완화하는 안은 아직 미적용(DROP을 막는 쪽이라 누락률 기준에 부합)
 - 한계: 정답 라벨이 없어 DROP이 맞았는지는 사람이 훑어봐야 하고, Gemini는 1회 실행 결과만 봄(재실행 시 판정이 달라질 수 있음)
 
+### QC 팔로워/구독자 게이트 추가 (`quality_control/follower_gate.py`, `config/follower_rule.yaml`)
+
+- 기준표(Conversation Stream): X / IG / YT, 팔로워·구독자 100k 이상. `Raw Data_원문`의 `source_widget` 접두어가 config `widgets`에 맞고 `snType column`이 TWITTER / INSTAGRAM / YOUTUBE인 행에만 적용(TikTok, Facebook, 전략법인 시트는 제외)
+- 판정: 100k 이상은 규칙 없음(KEEP), 0 초과 100k 미만은 DROP, 0·빈 값·숫자 아님·`Sender Profile Available`=False는 FLAG. 0을 FLAG로 둔 이유: Sprinklr `sender_profile.followers`가 위젯의 "0-500" 구간 계정뿐 아니라 apple(IG), Verizon(YT) 같은 큰 계정에도 0을 줌. 전체 차수 IG 계정 143개 중 39개가 정확히 0이고 1~500 값은 0건(X·YT에는 있음). 0이 "작다"인지 "모름"인지 값만으로 구분 불가 → 사용자 결정으로 FLAG
+- 위젯 범위는 확인 전이라 config 기본값을 `1.1.`(Comment)만으로 좁게 둠(DROP이 늘지 않는 쪽). 260927 최종본(CSV)과 URL로 대조하면 1.2 Reply·1.3 Repost도 100k 미만은 최종에 남지 않아 1.x 전체에 적용될 가능성이 있으나, 기준표의 "Others"(당사 법인 계정 발 게시글만)와의 관계는 사용자가 위젯에서 확인하기로 함
+- `--gates follower`, `--follower-config` 추가. 기본 실행(`--gates` 생략)은 scope와 follower를 모두 실행
+- 260927 실측(`--gates follower`): 1.1 Comment 74행 중 DROP 18행 / FLAG 20행(IG 프로필 6개), 나머지 KEEP. 최종본 대조 시 100k 미만 중 최종에 남은 게시물이 1건 있어 예외 원인(규칙 예외인지 수기 판단인지) 확인 필요
+- 테스트 `tests/test_follower_gate.py` 추가, 전체 77개 통과. 실제 파이프라인(run_pipeline)에는 아직 연결 안 함
+
 ### QC 시트 이름 변경: `QC_Flagged` -> `QC_Full`
 
 - `QC_Flagged`는 KEEP/FLAG/DROP 전체 행을 담는 시트라 FLAG 태깅과 헷갈려 `QC_Full`로 변경(`schema.py`의 `QC_SHEET_FULL`, `workbook_io.py`, `run.py` 설명, `tests/test_scope_gate.py` 반영)

@@ -23,6 +23,7 @@ from .schema import (
     Verdict,
     merge_outcomes,
 )
+from .follower_gate import run_follower_gate
 from .scope_gate import run_scope_gate
 from .workbook_io import load_input_workbook, read_raw_rows, write_qc_workbook
 
@@ -31,6 +32,7 @@ GateFn = Callable[[list[RawRow], GateContext], dict[str, GateOutcome]]
 # Phase 2(partner), Phase 3(global)가 여기에 추가된다.
 GATES: dict[str, GateFn] = {
     "scope": run_scope_gate,
+    "follower": run_follower_gate,
 }
 
 OUTPUT_SUFFIX = "_qc"
@@ -76,6 +78,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=Path,
         help="비모바일 scope 사전 YAML (기본: config/product_scope.yaml)",
     )
+    parser.add_argument(
+        "--follower-config",
+        type=Path,
+        help="팔로워 기준 YAML (기본: config/follower_rule.yaml)",
+    )
 
     return parser.parse_args(argv)
 
@@ -110,6 +117,7 @@ def run(args: argparse.Namespace) -> int:
         use_llm=not args.no_llm,
         workers=args.workers,
         scope_config_path=args.scope_config,
+        follower_config_path=args.follower_config,
     )
 
     workbook = load_input_workbook(input_path)

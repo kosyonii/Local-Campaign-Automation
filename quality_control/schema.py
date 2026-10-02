@@ -92,6 +92,7 @@ class GateContext:
     use_llm: bool = True
     workers: int | None = None
     scope_config_path: Path | None = None
+    follower_config_path: Path | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
 
