@@ -9,3 +9,4 @@ playwright
 pillow
 streamlit
 google-cloud-bigquery
+pyyaml

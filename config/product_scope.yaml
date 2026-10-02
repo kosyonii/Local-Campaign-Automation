@@ -1,0 +1,126 @@
+# QC Gate A — 전략법인 비모바일 scope 사전 (태스크 2)
+#
+# 매칭 규칙 (qc/scope_gate.py)
+#   - 대소문자 무시, NFKC 정규화 후 비교
+#   - 영문/숫자로 시작·끝나는 용어는 단어 경계를 적용한다.
+#       "TV"  -> "Molotov"의 tv, "TV5"는 불일치 / "TV를", "#TV", "Samsung_TV"는 일치
+#     한글·일본어 등 비라틴 문자는 경계로 취급한다(조사가 붙어도 일치).
+#   - 용어 안의 공백은 공백/-/_/. 0개 이상으로 매칭한다.
+#       "Smart Switch" = SmartSwitch = Smart_Switch = #Smart-Switch
+#   - "re:" 접두어를 붙이면 정규식을 그대로 쓴다(경계 자동 적용 안 함).
+#
+# 판정 흐름
+#   비모바일 용어 없음                        -> KEEP
+#   비모바일 용어 + mobile_strong            -> KEEP  (규칙만 기록)
+#   비모바일 용어 + mobile_weak만            -> FLAG  (Gemini 호출 안 함)
+#   비모바일 용어 + 모바일 신호 없음          -> Gemini 텍스트 판정
+#       NON_MOBILE_ONLY + 원문 근거 검증 통과 -> DROP
+#       그 외(MOBILE_RELATED / UNCLEAR / 오류) -> FLAG
+#
+# 사전은 "DROP을 막는 쪽"에 넉넉하게, "DROP을 만드는 쪽"에 좁게 유지한다.
+# (애매하면 포함 / 누락률 1순위)
+
+# ---------------------------------------------------------------------------
+# 제외 사전 (비모바일)
+# ---------------------------------------------------------------------------
+nonmobile:
+  - family: TV
+    terms:
+      - TV
+      - Samsung TV   # SamsungTV 해시태그처럼 붙여 쓴 표기(경계 규칙 때문에 TV만으로는 불일치)
+      - 텔레비전
+      - テレビ
+      - 电视
+      - télévision
+      - televisor
+      - Fernseher
+      # 아래는 제안 항목 — 검토 후 삭제/유지
+      - Neo QLED
+      - QLED
+      - OLED
+      - The Frame
+      - Crystal UHD
+      - Micro LED
+
+  - family: Odyssey
+    terms:
+      - Odyssey
+      - Samsung Odyssey
+
+  - family: Soundbar
+    terms:
+      - Soundbar
+      - Samsung Soundbar
+      - Sound bar
+      - 사운드바
+
+  - family: JBL
+    terms:
+      - JBL
+
+  - family: SmartSwitch
+    terms:
+      - Smart Switch
+      - 스마트 스위치
+      - スマートスイッチ
+
+  - family: SamsungCare+
+    terms:
+      - Samsung Care+
+      - Samsung Care Plus
+      - 삼성케어플러스
+      - 삼성케어+
+
+  - family: Bespoke
+    terms:
+      - Bespoke
+      - Samsung Bespoke
+      - 비스포크
+
+# ---------------------------------------------------------------------------
+# 포함 사전 (모바일 신호) — 강: 있으면 DROP 불가이고 KEEP
+# Galaxy 폰·Watch·Buds·Ring·Tab·Fold/Flip 등. (Watch/Buds 포함은 확정 사항)
+# ---------------------------------------------------------------------------
+mobile_strong:
+  terms:
+    - Galaxy
+    - 갤럭시
+    - ギャラクシー
+    - Buds
+    - 버즈
+    - One UI
+    - Unpacked
+    - 언팩
+    - Galaxy AI
+    - Circle to Search
+    - re:(?<![0-9A-Za-z])Z[\s\-_.]*(?:Fold|Flip)(?![A-Za-z])
+    - re:(?<![0-9A-Za-z])(?:Fold|Flip)[\s\-_.]*\d{1,2}(?![0-9A-Za-z])
+    - re:(?<![0-9A-Za-z])S[\s\-_.]?\d{2}(?:[\s\-_.]?(?:Ultra|FE|Edge|\+))?(?![0-9A-Za-z])
+    - 폴드
+    - 플립
+
+# ---------------------------------------------------------------------------
+# 포함 사전 (모바일 신호) — 약: 일반어. 있으면 DROP 불가이고 FLAG
+# ("Dein Phone, deine Size" 같은 폰 게시물이 비모바일 해시태그에 오탐되는 경우 보호)
+# ---------------------------------------------------------------------------
+mobile_weak:
+  terms:
+    - phone
+    - smartphone
+    - 폰
+    - 스마트폰
+    - 휴대폰
+    - 핸드폰
+    - Handy
+    - téléphone
+    - teléfono
+    - telefone
+    - celular
+    - スマホ
+    - スマートフォン
+    - 携帯
+    - 手机
+    - ponsel
+    - điện thoại
+    - هاتف
+    - موبايل
