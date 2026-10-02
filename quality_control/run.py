@@ -24,6 +24,7 @@ from .schema import (
     merge_outcomes,
 )
 from .follower_gate import run_follower_gate
+from .partner_gate import run_partner_gate
 from .scope_gate import run_scope_gate
 from .workbook_io import load_input_workbook, read_raw_rows, write_qc_workbook
 
@@ -33,7 +34,11 @@ GateFn = Callable[[list[RawRow], GateContext], dict[str, GateOutcome]]
 GATES: dict[str, GateFn] = {
     "scope": run_scope_gate,
     "follower": run_follower_gate,
+    "partner": run_partner_gate,
 }
+
+# partner는 프롬프트 확인 전이라 기본 실행에서 뺀다(--gates scope,follower,partner로 명시 실행).
+DEFAULT_GATES = ("scope", "follower")
 
 OUTPUT_SUFFIX = "_qc"
 DROP_PREVIEW_CHARS = 70
@@ -62,7 +67,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--gates",
-        default=",".join(GATES),
+        default=",".join(DEFAULT_GATES),
         help=f"실행할 게이트, 쉼표 구분 (사용 가능: {', '.join(GATES)})",
     )
     parser.add_argument(
@@ -77,6 +82,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--scope-config",
         type=Path,
         help="비모바일 scope 사전 YAML (기본: config/product_scope.yaml)",
+    )
+    parser.add_argument(
+        "--partner-config",
+        type=Path,
+        help="파트너 당사 키워드 YAML (기본: config/partner_scope.yaml)",
     )
     parser.add_argument(
         "--follower-config",
@@ -118,6 +128,7 @@ def run(args: argparse.Namespace) -> int:
         workers=args.workers,
         scope_config_path=args.scope_config,
         follower_config_path=args.follower_config,
+        partner_config_path=args.partner_config,
     )
 
     workbook = load_input_workbook(input_path)
@@ -147,9 +158,10 @@ def run(args: argparse.Namespace) -> int:
         workbook, output_path, rows, raw_columns, records
     )
 
-    checkpoint_path = ctx.extra.get("scope_checkpoint_path")
-    if checkpoint_path is not None:
-        remove_checkpoint(checkpoint_path)
+    for extra_key in ("scope_checkpoint_path", "partner_checkpoint_path"):
+        checkpoint_path = ctx.extra.get(extra_key)
+        if checkpoint_path is not None:
+            remove_checkpoint(checkpoint_path)
 
     print_summary(rows, records, counts, output_path)
     return 0

@@ -93,6 +93,7 @@ class GateContext:
     workers: int | None = None
     scope_config_path: Path | None = None
     follower_config_path: Path | None = None
+    partner_config_path: Path | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
 

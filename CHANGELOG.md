@@ -1,5 +1,5 @@
 # 수정 로그
-# written automatically by claude / revised & reviewed by Seoyeon Ko
+# written automatically by claude / revised & reviewed by RA
 
 ## 2026-10-02
 
@@ -23,6 +23,25 @@
 - 발견한 문제 ① Gemini `reason` 한국어가 깨진 행이 있음(149, 184 DROP, 8 FLAG 등). 판정·근거 검증에는 영향 없으나 리뷰어가 읽는 칸이라 품질 문제
 - 발견한 문제 ② 사전 경계 규칙 때문에 붙여 쓴 해시태그(`#GalaxyZFold8Ultra`, `#TeamGalaxy`)는 `mobile_strong`에 안 걸림. 행 190은 Gemini가 구해 FLAG가 됐지만 사전 단계에서는 보호받지 못함. Galaxy·갤럭시를 경계 없이 매칭하도록 완화하는 안은 아직 미적용(DROP을 막는 쪽이라 누락률 기준에 부합)
 - 한계: 정답 라벨이 없어 DROP이 맞았는지는 사람이 훑어봐야 하고, Gemini는 1회 실행 결과만 봄(재실행 시 판정이 달라질 수 있음)
+
+### QC 파트너 게이트 추가 - 키워드 + 텍스트 LLM (`quality_control/partner_gate.py`, 프롬프트 확인 대기)
+
+- 결정: 파트너 위젯의 당사 무관 게시물은 Sprinklr payload 쿼리에 키워드를 AND로 붙이는 방식 대신 기존대로 키워드 + 텍스트 LLM으로 거름. 사용자가 대시보드에서 테스트해 보니 필터링 효과가 약했고, Raw에 안 잡히는 누락 위험(감사 불가)을 지지 않기로 함. payload 파일은 수정하지 않음
+- 범위: `Raw Data_원문`의 `source_widget`이 `3.`으로 시작하는 행(3. Partner X/IG/YT/TT). 당사 관련 범위는 "Samsung 전체"(모바일 한정 아님)
+- 판정: 당사 키워드(본문+계정명) 히트는 KEEP(규칙 기록), 키워드 없음 + 본문 3자 미만(URL·공백 제외)은 FLAG, 그 외는 Gemini 텍스트 판정. `UNRELATED_TO_SAMSUNG` + 근거 인용이 원문에 존재 + 당사 신호 없음일 때만 DROP, `SAMSUNG_RELATED`/`UNCLEAR`/근거 미검증/LLM 실패/`--no-llm`은 FLAG
+- 사전 `config/partner_scope.yaml`: samsung, galaxy, 삼성, 갤럭시 등 핵심 브랜드는 부분 문자열 정규식(붙여 쓴 해시태그, 한국어 조사 대응), 다국어 표기와 브랜드명 없는 제품명(One UI, QLED 등)은 단어 경계 적용. 와일드카드가 Sprinklr에서 안 돼서 만든 payload용 키워드 목록과는 별개
+- 프롬프트 초안 `prompts/qc_partner_system_prompt.txt`: 사용자 확인 전이라 Gemini 실호출 검증은 하지 않음. 그래서 `partner`는 `--gates` 기본값에서 뺌(`DEFAULT_GATES = scope, follower`), `--gates scope,follower,partner`로 명시 실행. `--partner-config` 추가. 체크포인트는 `partner_checkpoint_path`로 별도 관리
+- 테스트 `tests/test_partner_gate.py` 추가(가짜 judge), 전체 116개 통과
+- 데이터 확인(Gemini 호출 없음): 15개 차수 Raw의 파트너 고유 게시물 289건 중 키워드 히트 10건, 본문 짧음 2건, LLM 필요 277건(X 241, IG 20, YT 14, TT 14). 최종본(7/22~9/27)과 URL로 맞춘 파트너 게시물 6건 중 5건은 키워드로 잡히지만 1건(Singtel YT, 본문에 삼성 언급 없음, 영상)은 안 잡힘. 텍스트만 보는 LLM이 이런 글을 UNRELATED로 보고 DROP할 위험이 실제로 존재
+- 대응(사용자 승인): `llm_drop_channels: [TWITTER]` 추가. 키워드가 없는 IG / YT / TT 게시물은 본문이 약하고 영상·이미지에 삼성이 나올 수 있어 LLM을 호출하지 않고 FLAG(`PARTNER_MEDIA_CHANNEL`). X만 LLM이 DROP 가능. 테스트 120개 통과
+- Gemini 평가(프롬프트 초안 그대로, 15개 차수 파트너 고유 게시물 289건, 결과는 스크래치패드 전용): DROP 193(전부 X) / FLAG 86 / KEEP 10. FLAG 86 = IG·YT·TT 키워드 없음 46, LLM 판단 불가 21, 근거 미검증 17, 본문 없음 2. 최종본에 남은 파트너 게시물 6건은 전부 보존(KEEP 5, Singtel YT는 FLAG)
+- DROP 193건 중 기기·모바일 단어가 있는 75건을 직접 훑음: 아이폰/애플워치 출시 안내(통신사·리테일러), TCL TV, Redmi, Meta 안경, 9/11 추모 등 삼성 무관 확인. 오DROP은 못 찾음. 다만 양성 표본이 6건뿐이라 누락률이 낮다는 증거로는 약함(여러 주 누적 필요)
+- FLAG 중 "근거 미검증" 17건은 일본어 등 긴 본문에서 LLM이 인용한 근거가 원문에서 확인되지 않아 FLAG가 된 무관 게시물로 보임. 인용 검증이 너무 엄격한지(공백·줄바꿈·전각 처리)는 아직 확인 안 함
+- 프롬프트는 사용자가 "일단 해봐"로 진행 승인(고칠 곳 없음 확인은 아님)
+- 안정화(scope 게이트의 `evidence_in_text`와 같은 방식을 적용): 근거 미검증 17건의 원인이 scope에서 찾은 것과 같은 유형이라 `evidence_in_text`(따옴표·HTML 엔티티·`...` 보정)로 인용을 검증하고, 파트너판 `response_is_clean()` / `make_stable_judge()`를 `partner_gate.py`에 추가(깨진 응답 최대 3번 재호출, DROP 후보는 2번 호출이 모두 당사 무관이어야 확정). scope 전용 값에 묶인 `scope_gate.make_stable_judge`는 다른 세션이 정리한 파일이라 건드리지 않고 로직만 복제함(공통화는 나중 과제). 전달 JSON 파싱 오류·빈 응답도 재시도
+- 재평가(같은 289건, 실제 Gemini): DROP 207(+14) / FLAG 72 / KEEP 10. 근거 미검증 17 -> 0. FLAG 72 = IG·YT·TT 키워드 없음 46, LLM 판단 불가 21, LLM 관련 판정 2, 본문 없음 2, LLM 오류 1(JSON 파싱 오류, 이후 재시도 추가). 최종본 파트너 6건은 이번에도 전부 보존(KEEP 5, Singtel YT는 FLAG)
+- LLM 관련 판정 2건: 하나는 아이폰 광고인데 "가변 조리개"를 갤럭시 S9로 착각한 오판(FLAG라 무해), 다른 하나는 퀄컴 Snapdragon Summit(삼성 갤럭시 칩셋 협력 맥락). 판단 불가 21건은 인텔 노트북, 세탁기·건조기 글, Snapdragon Summit 중계, 짧은 링크 글 등으로 FLAG가 맞는 방향
+- 한계: DROP 호출이 2번씩이라 호출량이 약 2배(X 키워드 없는 글 약 210건 기준 약 420회). 표본의 양성이 6건뿐이라 누락률 검증은 여전히 약함
 
 ### QC 팔로워/구독자 게이트 추가 (`quality_control/follower_gate.py`, `config/follower_rule.yaml`)
 
