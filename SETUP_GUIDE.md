@@ -1,6 +1,6 @@
-# 팀원용 설치 및 실행 가이드 (Windows, PowerShell / VS Code)
+# 설치 및 실행 가이드 (Windows, PowerShell / VS Code)
 
-각자 PC에서 이 파이프라인을 처음 세팅하고 실행하는 순서입니다. 위에서 아래로 순서대로 진행하세요.
+로컬 PC에서 이 파이프라인을 처음 세팅하고 실행하는 순서입니다. 
 세부 설명이 필요하면 `README.md`의 해당 장을 참고합니다.
 
 예상 소요: 최초 세팅 30~60분 (계정/권한 발급 대기 시간 제외)
@@ -17,8 +17,6 @@
 | Sprinklr API Key, Access Token | 1단계 데이터 추출 | 레포 담당자 |
 | Google Cloud 계정 + 프로젝트(`slcc-buzz-agent-dev`) 접근 권한 | 4단계 Gemini 분석 | 레포 담당자 |
 | (선택) Instagram `cookies.txt` | IG 미디어 다운로드 성공률 향상 | 2-6단계 참고 |
-
-> API Key, Token, `.env`, 서비스 계정 JSON은 메일·메신저·Git으로 공유하지 않습니다.
 
 ---
 
@@ -41,13 +39,32 @@
 
 ### 2-1. 코드 받기
 
+본인 상황에 맞는 방법 하나만 진행합니다. 어느 쪽이든 검증이 끝난 버전만 올라가는 `main` 브랜치를 사용합니다.
+
+**방법 A. 처음 받는 경우**
+
 ```powershell
-cd "$HOME\Desktop"
+cd "$HOME\Desktop"    # 레포를 둘 폴더로 이동 (원하는 폴더면 어디든 됨)
 git clone https://github.com/kosyonii/Local-Campaign-Automation.git
 cd Local-Campaign-Automation
 ```
 
-기본 브랜치는 `main`입니다. 검증이 끝난 버전만 `main`에 올라가므로 `main`을 사용합니다.
+**방법 B. 기존 레포(`dkyng11-25/Local-Campaign-Automation`)를 이미 받아 둔 경우**
+
+새로 받을 필요 없이 기존 폴더에서 아래만 실행합니다. `.env`, `.venv`, 브라우저 로그인 세션, `.instagram_cookies.txt`는 git에 올라가지 않는 파일이라 그대로 쓰고, 2-3~2-6단계는 다시 하지 않아도 됩니다.
+
+```powershell
+cd "기존_레포_폴더_경로"
+git status                  # 직접 수정한 파일이 있는지 확인 (아래 주의 참고)
+git remote add seoyeon https://github.com/kosyonii/Local-Campaign-Automation.git
+git fetch seoyeon
+git checkout -b seoyeon-main seoyeon/main
+```
+
+이후 업데이트는 이 브랜치(`seoyeon-main`)에서 `git pull`만 하면 됩니다.
+
+> **주의:** `git status`에 수정된 파일이 보이면(특히 `payload\*.json`) `git checkout`이 막힐 수 있습니다. 직접 수정한 내용이 필요 없다면 `git stash`로 잠시 치워 두고, 필요한 수정이었다면 담당자에게 먼저 문의하세요.
+> 기존 레포의 `main` 브랜치는 그대로 두므로 언제든 `git checkout main`으로 돌아갈 수 있습니다.
 
 ### 2-2. 가상환경 만들고 패키지 설치
 
@@ -220,6 +237,8 @@ uv run python llm_analysis_pipeline.py --output-dir "output\260927"
 git pull
 uv sync
 ```
+
+(2-1 방법 B로 받았다면 `seoyeon-main` 브랜치에 있는 상태에서 실행합니다. `git branch`로 확인할 수 있습니다.)
 
 pip 방식은 `git pull` 후 `pyproject.toml`/`requirements.txt`가 바뀌었을 때만 `python -m pip install -r requirements.txt`를 다시 실행합니다.
 
