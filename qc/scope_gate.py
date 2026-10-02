@@ -300,6 +300,21 @@ class Judgement:
 
 Judge = Callable[[ScopeQuery], Judgement]
 
+_HANGUL_RE = re.compile("[가-힣]")
+_HANGUL_JAMO_RE = re.compile("[ᄀ-ᇿ㄰-㆏ꥠ-꥿ힰ-퟿]")
+
+
+def reason_is_garbled(reason: str) -> bool:
+    """한국어 reason이 깨졌는지 본다.
+
+    잡는 것: 한글이 없는 경우(로마자 표기로 대답), 자모가 낱개로 섞인 경우.
+    못 잡는 것: 음절만 틀린 오타(예: '가잔제품').
+    """
+
+    return not _HANGUL_RE.search(reason) or bool(
+        _HANGUL_JAMO_RE.search(reason)
+    )
+
 
 def build_user_message(query: ScopeQuery) -> str:
     matched = "; ".join(
@@ -341,6 +356,9 @@ def build_gemini_judge(
         max_output_tokens=lap.MAX_OUTPUT_TOKENS,
         response_mime_type="application/json",
         response_json_schema=JUDGE_RESPONSE_SCHEMA,
+        # thinking_config는 일부러 지정하지 않는다. low/minimal로 두면 reason 깨짐은
+        # 사라지지만 모바일 맥락 판정이 약해져(260927 행 205: 📱·SmartThings 원격 제어)
+        # 12/12 NON_MOBILE_ONLY가 된다. 누락률이 우선이라 기본값을 유지한다.
     )
 
     def judge(query: ScopeQuery) -> Judgement:
@@ -358,7 +376,15 @@ def build_gemini_judge(
                 if not text:
                     raise ValueError("빈 응답")
 
-                return Judgement.from_dict(json.loads(text))
+                judgement = Judgement.from_dict(json.loads(text))
+
+                # 깨진 reason은 재시도. 끝까지 깨지면 판정은 유효하므로 그대로 쓴다.
+                if reason_is_garbled(judgement.reason) and (
+                    attempt < lap.MAX_RETRIES
+                ):
+                    continue
+
+                return judgement
             except Exception as exc:  # noqa: BLE001 - 재시도 여부를 아래서 판단
                 last_exc = exc
 

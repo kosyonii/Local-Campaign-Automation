@@ -1,6 +1,34 @@
 # 수정 로그
 # written automatically by claude / revised & reviewed by Seoyeon Ko
 
+## 2026-10-02
+
+### QC Phase 1(scope 게이트) 260927 데이터 검증 (코드 변경 없음)
+
+- 대상: `output/260927/260927_SLCC_SOV_Local Campaign Tracking_9월_v01.xlsx` (원문 216행 + 전략법인 235행). 결과 파일은 스크래치패드에만 저장, `output/` 원본은 건드리지 않음. 게이트는 전략법인 시트만 대상
+- 환경: `.venv`에 `pyyaml`이 없어 `qc.run`이 ImportError → `ensurepip`로 pip 설치 후 `pyyaml` 설치(`requirements.txt`에는 이미 있음, venv만 비어 있었음)
+- `--no-llm`: KEEP 417 / FLAG 34 / DROP 0. 비모바일 용어 히트 38행 중 강한 모바일 신호 4행(KEEP, 규칙만 기록), 약한 신호 1행(FLAG), Gemini 필요 33행
+- Gemini 포함: KEEP 417 / FLAG 8 / DROP 26. DROP 26건 = TV·Bespoke·Odyssey·Soundbar 전용 게시물. FLAG 8 = `SCOPE_LLM_MOBILE` 3(190 Z Fold8 Ultra+SmartSwitch, 205 Bespoke+SmartThings, 208 Smart Switch로 새 폰 이전), `SCOPE_DROP_UNVERIFIED` 4(8, 25, 37, 135), 약한 신호 1(209)
+- 누락(오DROP) 점검: DROP 26건의 본문에서 모바일 단서를 찾았으나 없음(계정 bio `#GalaxyAI`, Sender Website의 ZFold 링크는 계정 단위 정보라 게시물 판단 근거가 아님). 명백한 오DROP은 못 찾음
+- 확인 필요 DROP: 행 184(Molotov TV Awards 협찬, 경품 TV) — 프롬프트상 "방송사·시상식 이름의 TV"는 UNCLEAR인데 Gemini가 NON_MOBILE_ONLY로 판정. 애매하면 포함 원칙상 FLAG가 맞아 보임(사람이 최종 판단). 행 41(삼성 TV 플러스 콘서트 중계)·62(The Frame)도 한 번 더 훑어볼 것
+- 발견한 문제 ① Gemini `reason` 한국어가 깨진 행이 있음(149, 184 DROP, 8 FLAG 등). 판정·근거 검증에는 영향 없으나 리뷰어가 읽는 칸이라 품질 문제
+- 발견한 문제 ② 사전 경계 규칙 때문에 붙여 쓴 해시태그(`#GalaxyZFold8Ultra`, `#TeamGalaxy`)는 `mobile_strong`에 안 걸림. 행 190은 Gemini가 구해 FLAG가 됐지만 사전 단계에서는 보호받지 못함. Galaxy·갤럭시를 경계 없이 매칭하도록 완화하는 안은 아직 미적용(DROP을 막는 쪽이라 누락률 기준에 부합)
+- 한계: 정답 라벨이 없어 DROP이 맞았는지는 사람이 훑어봐야 하고, Gemini는 1회 실행 결과만 봄(재실행 시 판정이 달라질 수 있음)
+
+### QC scope 게이트: Gemini `reason` 글자 깨짐 대응 (`qc/scope_gate.py`)
+
+- 재현: 같은 입력을 반복 호출하면 약 10%(40회 중 4~5회)에서 한국어 reason이 깨짐. 유형은 ① 로마자 표기로 대답(`i gesimuleun ...`), ② 자모가 낱개로 섞임, ③ 음절 오타(`가잔제품`, `읈습니다`). 판정(verdict)·근거 검증에는 영향 없음. temperature 0이면 40회 중 2회로 줄지만 0은 아님
+- 시도했다가 되돌린 것: `thinking_level` low/minimal → 깨짐은 120회 호출에서 0건이었으나 행 205(Bespoke+SmartThings 원격 제어, 📱)가 NON_MOBILE_ONLY 12/12로 바뀜(기본값은 MOBILE_RELATED 12/12). 누락률 우선 원칙에 어긋나 적용하지 않음
+- 적용: `reason_is_garbled()` 추가. 한국어 부분에 한글이 없거나 낱개 자모가 있으면 같은 호출을 재시도(최대 `MAX_RETRIES`), 끝까지 깨지면 판정은 유효하므로 그대로 사용. 전체 재실행에서 이 유형 깨짐 0건. 한계: 음절 오타(③)는 못 잡음
+- 부수 발견: Gemini 판정은 호출마다·설정마다 흔들림. 같은 입력의 전체 실행에서 DROP이 26 → 28건, 행 8·25·37·135의 DROP_UNVERIFIED도 실행마다 달라짐. 행 184는 어느 설정에서도 NON_MOBILE_ONLY(DROP)
+- 행 205류(📱·원격 제어·SmartThings만 있는 가전 게시물)는 설정에 따라 DROP될 수 있어, `prompts/qc_scope_system_prompt.txt`의 MOBILE_RELATED 정의에 "폰 이모지(📱🤳)나 폰/앱으로 가전·TV를 원격 제어하는 맥락은 폰 모델이 없어도 모바일 맥락" 문장을 추가(프롬프트가 바뀌어 기존 scope 체크포인트는 자동 무효화됨)
+- 검증(기본 thinking, 행당 10회): 205는 MOBILE_RELATED 10/10(이전 설정에선 NON_MOBILE_ONLY 12/12가 나오던 행). 순수 가전·TV 게시물 9행(6, 173, 7, 31, 62, 2, 49, 136, 149)은 전부 NON_MOBILE_ONLY 10/10 유지. 표본이 10행이라 다른 유형의 가전 게시물에서 오FLAG/오DROP이 없다는 보장은 아님
+- QC `reason`은 한국어만 쓰도록 변경: `prompts/qc_scope_system_prompt.txt`의 [reason]에서 영어 병기("<한국어> / <영어>")를 제거(직전 커밋 "Bilingual reason in scope prompt"를 되돌리는 변경). `reason_is_garbled()`는 reason 전체에서 한글 유무·낱개 자모를 검사하도록 단순화. 프롬프트가 바뀌어 scope 체크포인트는 자동 무효화됨
+- 행 184(Molotov TV Awards 협찬, 경품 TV)는 비모바일이 맞다고 사용자 확인 → DROP 유지, 규칙 추가 안 함
+- 최종 산출물(한국어 reason 프롬프트로 재생성): `output/260927/260927_SLCC_SOV_Local Campaign Tracking_9월_v01_qc.xlsx` (원본 시트 2개 + QC_Flagged 451 / QC_Clean 426 / QC_Dropped 25행). 판정 KEEP 417 / FLAG 9 / DROP 25. FLAG는 전략법인 행 25, 37, 135, 172, 184, 190, 205, 208, 209. reason은 영어 병기 0건 확인. 원본 v01.xlsx는 수정하지 않음. 엑셀에서 파일을 열어 둔 상태로 실행하면 저장이 PermissionError로 실패(체크포인트는 남아 재실행 시 복원)
+- 행 184는 이번 실행에서 근거 인용 검증 실패(DROP_UNVERIFIED)로 FLAG가 됨. 비모바일 DROP이 맞다는 판단과 달리 FLAG로 남는 건 실행마다 달라지는 Gemini 인용 때문
+- 실행마다 DROP_UNVERIFIED 대상 행이 바뀜(이번엔 8이 DROP, 136이 FLAG). 근거 인용 검증에 걸린 행은 FLAG로 남으므로 누락 쪽 안전장치는 유지되나 FLAG 개수는 실행마다 달라질 수 있음
+
 ## 2026-10-01
 
 ### 팀원용 설치·실행 가이드 추가 및 README 실행 안내 정정
