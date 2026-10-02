@@ -25,7 +25,7 @@ List the product names that can be confirmed from the post text, as arrays. Use 
 If verdict is NON_MOBILE_ONLY, non_mobile_products must not be empty and mobile_products must be empty.
 
 [reason]
-Explain your decision in one sentence, written in Korean (it is read by Korean reviewers).
+Explain your decision in one sentence, written in both Korean and English, in the format "<Korean sentence> / <English sentence>" (it is read by Korean reviewers and may be shared with English-speaking colleagues).
 
 [confidence]
 An integer from 0 to 100. For reference only; it is not used in the decision rules.
