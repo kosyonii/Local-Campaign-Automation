@@ -1,4 +1,4 @@
-"""Raw Excel 읽기와 QC 시트(QC_Flagged / QC_Clean / QC_Dropped) 쓰기.
+"""Raw Excel 읽기와 QC 시트(QC_Full / QC_Clean / QC_Dropped) 쓰기.
 
 - 원본 파일은 건드리지 않고 별도 파일로 저장한다. 원본 시트는 그대로 보존된다.
 - 이미 QC 시트가 있는 파일을 다시 처리하면 QC 시트만 새로 만든다(재실행 멱등).
@@ -20,7 +20,7 @@ from .schema import (
     QC_COLUMNS,
     QC_SHEET_CLEAN,
     QC_SHEET_DROPPED,
-    QC_SHEET_FLAGGED,
+    QC_SHEET_FULL,
     QC_SHEETS,
     QC_TRACE_COLUMNS,
     RAW_SHEETS,
@@ -167,14 +167,14 @@ def write_qc_workbook(
     clean = [e for e in entries if e[1].verdict is not Verdict.DROP]
     dropped = [e for e in entries if e[1].verdict is Verdict.DROP]
 
-    _write_sheet(workbook, QC_SHEET_FLAGGED, columns, entries)
+    _write_sheet(workbook, QC_SHEET_FULL, columns, entries)
     _write_sheet(workbook, QC_SHEET_CLEAN, columns, clean)
     _write_sheet(workbook, QC_SHEET_DROPPED, columns, dropped)
 
     workbook.save(output_path)
 
     return {
-        QC_SHEET_FLAGGED: len(entries),
+        QC_SHEET_FULL: len(entries),
         QC_SHEET_CLEAN: len(clean),
         QC_SHEET_DROPPED: len(dropped),
     }

@@ -1,6 +1,6 @@
 # QC Gate A — 전략법인 비모바일 scope 사전 (태스크 2)
 #
-# 매칭 규칙 (qc/scope_gate.py)
+# 매칭 규칙 (quality_control/scope_gate.py)
 #   - 대소문자 무시, NFKC 정규화 후 비교
 #   - 영문/숫자로 시작·끝나는 용어는 단어 경계를 적용한다.
 #       "TV"  -> "Molotov"의 tv, "TV5"는 불일치 / "TV를", "#TV", "Samsung_TV"는 일치

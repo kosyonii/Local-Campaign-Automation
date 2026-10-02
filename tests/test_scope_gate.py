@@ -10,8 +10,8 @@ from openpyxl import Workbook, load_workbook
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from qc import run as qc_run  # noqa: E402
-from qc.schema import (  # noqa: E402
+from quality_control import run as qc_run  # noqa: E402
+from quality_control.schema import (  # noqa: E402
     RAW_SHEET_ORIGINAL,
     RAW_SHEET_SUBSIDIARY,
     GateContext,
@@ -20,7 +20,7 @@ from qc.schema import (  # noqa: E402
     Verdict,
     merge_outcomes,
 )
-from qc.scope_gate import (  # noqa: E402
+from quality_control.scope_gate import (  # noqa: E402
     DEFAULT_SCOPE_CONFIG_PATH,
     Judgement,
     ScopeQuery,
@@ -341,7 +341,7 @@ def test_end_to_end_workbook(tmp_path, monkeypatch):
     build_input(source)
     before = source.read_bytes()
 
-    monkeypatch.setattr("qc.scope_gate.build_gemini_judge", lambda: fake_judge)
+    monkeypatch.setattr("quality_control.scope_gate.build_gemini_judge", lambda: fake_judge)
 
     out = tmp_path / "raw_qc.xlsx"
     assert qc_run.main([str(source), "-o", str(out), "--workers", "2"]) == 0
@@ -352,7 +352,7 @@ def test_end_to_end_workbook(tmp_path, monkeypatch):
     assert wb.sheetnames == [
         RAW_SHEET_ORIGINAL,
         RAW_SHEET_SUBSIDIARY,
-        "QC_Flagged",
+        "QC_Full",
         "QC_Clean",
         "QC_Dropped",
     ]
@@ -366,7 +366,7 @@ def test_end_to_end_workbook(tmp_path, monkeypatch):
         header = [c.value for c in sheet[1]]
         return [dict(zip(header, r)) for r in sheet.iter_rows(min_row=2, values_only=True)]
 
-    flagged, clean, dropped = table("QC_Flagged"), table("QC_Clean"), table("QC_Dropped")
+    flagged, clean, dropped = table("QC_Full"), table("QC_Clean"), table("QC_Dropped")
 
     assert len(flagged) == 6  # 원문 1 + 전략법인 5
     assert len(dropped) == 1 and len(clean) == 5
@@ -395,7 +395,7 @@ def test_end_to_end_workbook(tmp_path, monkeypatch):
 def test_rerun_on_qc_output_is_idempotent(tmp_path, monkeypatch):
     source = tmp_path / "raw.xlsx"
     build_input(source)
-    monkeypatch.setattr("qc.scope_gate.build_gemini_judge", lambda: fake_judge)
+    monkeypatch.setattr("quality_control.scope_gate.build_gemini_judge", lambda: fake_judge)
 
     first = tmp_path / "raw_qc.xlsx"
     qc_run.main([str(source), "-o", str(first), "--workers", "2"])
@@ -403,8 +403,8 @@ def test_rerun_on_qc_output_is_idempotent(tmp_path, monkeypatch):
     qc_run.main([str(first), "-o", str(second), "--workers", "2"])
 
     wb = load_workbook(second)
-    assert wb.sheetnames.count("QC_Flagged") == 1
-    assert wb["QC_Flagged"].max_row == 7
+    assert wb.sheetnames.count("QC_Full") == 1
+    assert wb["QC_Full"].max_row == 7
     assert wb["QC_Dropped"].max_row == 2
 
 
@@ -445,7 +445,7 @@ def test_checkpoint_resume_skips_successful_rows(tmp_path):
             raise RuntimeError("503 unavailable")
         return fake_judge(query)
 
-    from qc import scope_gate
+    from quality_control import scope_gate
 
     wb = load_workbook(source)
     rows, _ = qc_run.read_raw_rows(wb)
@@ -471,7 +471,7 @@ def test_checkpoint_ignored_when_input_changes(tmp_path):
     source = tmp_path / "raw.xlsx"
     build_input(source)
     out = tmp_path / "raw_qc.xlsx"
-    from qc import scope_gate
+    from quality_control import scope_gate
 
     wb = load_workbook(source)
     rows, _ = qc_run.read_raw_rows(wb)

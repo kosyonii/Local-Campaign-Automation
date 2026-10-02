@@ -1,8 +1,8 @@
 """QC 게이트 CLI.
 
-    python -m qc.run INPUT.xlsx [-o OUTPUT.xlsx] [--gates scope] [--no-llm]
+    python -m quality_control.run INPUT.xlsx [-o OUTPUT.xlsx] [--gates scope] [--no-llm]
 
-원본 시트는 그대로 두고 QC_Flagged / QC_Clean / QC_Dropped 시트를 추가한 새 파일을 만든다.
+원본 시트는 그대로 두고 QC_Full / QC_Clean / QC_Dropped 시트를 추가한 새 파일을 만든다.
 """
 
 from __future__ import annotations
@@ -48,7 +48,7 @@ def default_output_path(input_path: Path) -> Path:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        prog="python -m qc.run",
+        prog="python -m quality_control.run",
         description="Sprinklr raw 수기 검수 자동화 (DROP / FLAG / KEEP)",
     )
     parser.add_argument("input", type=Path, help="1단계 raw Excel")

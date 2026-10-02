@@ -15,6 +15,13 @@
 - 발견한 문제 ② 사전 경계 규칙 때문에 붙여 쓴 해시태그(`#GalaxyZFold8Ultra`, `#TeamGalaxy`)는 `mobile_strong`에 안 걸림. 행 190은 Gemini가 구해 FLAG가 됐지만 사전 단계에서는 보호받지 못함. Galaxy·갤럭시를 경계 없이 매칭하도록 완화하는 안은 아직 미적용(DROP을 막는 쪽이라 누락률 기준에 부합)
 - 한계: 정답 라벨이 없어 DROP이 맞았는지는 사람이 훑어봐야 하고, Gemini는 1회 실행 결과만 봄(재실행 시 판정이 달라질 수 있음)
 
+### QC 시트 이름 변경: `QC_Flagged` -> `QC_Full`
+
+- `QC_Flagged`는 KEEP/FLAG/DROP 전체 행을 담는 시트라 FLAG 태깅과 헷갈려 `QC_Full`로 변경(`schema.py`의 `QC_SHEET_FULL`, `workbook_io.py`, `run.py` 설명, `tests/test_scope_gate.py` 반영)
+- 기존 `output/260927/..._v01_qc.xlsx`의 시트 이름도 `QC_Full`로 변경(재실행 없이 이름만 변경, 판정 내용 그대로). 이 날짜 이전 항목의 `QC_Flagged` 표기는 당시 이름 그대로 둠
+- 폴더 `qc/`를 `quality_control/`로 변경(사용자 작업, 중간에 `quality-control/`이었으나 하이픈 때문에 import 불가). `tests/test_scope_gate.py`의 import와 monkeypatch 경로, `run.py` CLI 안내(`python -m quality_control.run`), `config/product_scope.yaml` 주석을 새 이름으로 수정. 이전 항목의 `qc.run` 표기는 당시 이름 그대로 둠
+- 검증: `.venv`에 pytest가 없어 설치 후 `tests/test_scope_gate.py` 51개 통과, `python -m quality_control.run --help` 동작 확인. `reason_is_garbled()` 테스트는 아직 없음
+
 ### QC scope 게이트: Gemini `reason` 글자 깨짐 대응 (`qc/scope_gate.py`)
 
 - 재현: 같은 입력을 반복 호출하면 약 10%(40회 중 4~5회)에서 한국어 reason이 깨짐. 유형은 ① 로마자 표기로 대답(`i gesimuleun ...`), ② 자모가 낱개로 섞임, ③ 음절 오타(`가잔제품`, `읈습니다`). 판정(verdict)·근거 검증에는 영향 없음. temperature 0이면 40회 중 2회로 줄지만 0은 아님
