@@ -82,10 +82,9 @@ uv sync
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
-python -m pip install pillow streamlit google-cloud-bigquery
 ```
 
-> `requirements.txt`에는 `pillow`, `streamlit`, `google-cloud-bigquery`가 빠져 있어서 마지막 줄을 따로 설치합니다.
+> `requirements.txt`에 필요한 패키지가 모두 들어 있어서 이 한 줄이면 됩니다.
 > `Activate.ps1` 실행이 막히면 `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`를 한 번 실행합니다.
 
 VS Code를 쓰는 경우: 폴더를 연 뒤 `Ctrl+Shift+P` → `Python: Select Interpreter` → `.venv`를 선택합니다. 터미널은 VS Code의 PowerShell을 그대로 쓰면 됩니다.

@@ -6,3 +6,6 @@ google-genai
 gallery-dl
 yt-dlp
 playwright
+pillow
+streamlit
+google-cloud-bigquery
