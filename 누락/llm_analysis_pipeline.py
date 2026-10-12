@@ -183,7 +183,7 @@ GOOGLE_CLOUD_PLATFORM_SCOPE = (
 )
 GEMINI_MODEL = os.getenv(
     "GEMINI_MODEL",
-    "gemini-3-flash-preview",
+    "gemini-3.8-flash",
 )
 
 TEMPERATURE = float(os.getenv("GEMINI_TEMPERATURE", "0.1"))
@@ -4425,7 +4425,7 @@ def parse_args() -> argparse.Namespace:
         type=str,
         help=(
             "사용할 Gemini 모델 ID. 미지정 시 GEMINI_MODEL 환경변수 또는 "
-            "기본값 gemini-2.5-flash 사용"
+            "기본값 gemini-3.8-flash 사용"
         ),
     )
     parser.add_argument(

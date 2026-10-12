@@ -1,6 +1,14 @@
 # 수정 로그
 # written automatically by claude / revised & reviewed by RA
 
+## 2026-10-12
+
+### Gemini 모델을 gemini-3.8-flash로 변경 (`llm_analysis_pipeline.py`, `누락/llm_analysis_pipeline.py`)
+
+- `GEMINI_MODEL` 기본값 `gemini-3-flash-preview` -> `gemini-3.8-flash`, `--model` 도움말의 잘못된 기본값 표기(`gemini-2.5-flash`)도 정정
+- 주의: 로컬 `.env`의 `GEMINI_MODEL`이 코드 기본값보다 우선하므로 `.env`도 같이 바꿔야 실제로 적용됨(`.env`는 gitignore라 커밋되지 않음, 다른 환경은 각자 수정 필요)
+- 검증: `create_genai_client()`로 Vertex 호출(project `slcc-buzz-agent-dev`, location `global`), `gemini-3.8-flash` 응답 정상(`model_version` 일치). 파이프라인 전체 실행은 하지 않음
+
 ## 2026-10-02
 
 ### QC scope 게이트 일관성 보강: 근거 인용 보정, 재시도, DROP 합의 (`quality_control/scope_gate.py`)
