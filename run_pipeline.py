@@ -398,6 +398,8 @@ def build_module_environment(
                 run_paths.media_dir
             ),
             "PYTHONUNBUFFERED": "1",
+            "PYTHONUTF8": "1",
+            "PYTHONIOENCODING": "utf-8",
         }
     )
 
@@ -503,6 +505,8 @@ def run_module(
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         bufsize=1,
         cwd=PROJECT_ROOT,
         env=module_environment,
@@ -1555,6 +1559,8 @@ def run_buzz_volume(
 
     process_environment = os.environ.copy()
     process_environment["PYTHONUNBUFFERED"] = "1"
+    process_environment["PYTHONUTF8"] = "1"
+    process_environment["PYTHONIOENCODING"] = "utf-8"
 
     process = subprocess.Popen(
         [
@@ -1565,6 +1571,8 @@ def run_buzz_volume(
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         bufsize=1,
         cwd=PROJECT_ROOT,
         env=process_environment,
@@ -2016,6 +2024,8 @@ def run_missing_cases_pipeline(
 
     environment = os.environ.copy()
     environment["PYTHONUNBUFFERED"] = "1"
+    environment["PYTHONUTF8"] = "1"
+    environment["PYTHONIOENCODING"] = "utf-8"
 
     process = subprocess.Popen(
         [
@@ -2026,6 +2036,8 @@ def run_missing_cases_pipeline(
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         bufsize=1,
         cwd=MISSING_ROOT,
         env=environment,
